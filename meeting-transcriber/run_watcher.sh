@@ -10,5 +10,4 @@ if [[ -f "$HOME/.meeting-transcriber.env" ]]; then
   set +a
 fi
 
-export TRANSCRIBE_CLI="${TRANSCRIBE_CLI:-$HOME/.codex/skills/transcribe/scripts/transcribe_diarize.py}"
 exec /usr/bin/python3 "$PWD/meeting_transcriber.py" --config "$PWD/config.json"

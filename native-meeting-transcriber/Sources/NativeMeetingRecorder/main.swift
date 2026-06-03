@@ -176,7 +176,7 @@ private final class AudioMeterOutput: NSObject, SCStreamOutput {
     }
 }
 
-private final class RecordingDelegate: NSObject, SCRecordingOutputDelegate, SCStreamDelegate {
+private final class RecordingDelegate: NSObject, SCRecordingOutputDelegate, SCStreamDelegate, @unchecked Sendable {
     private let finishSemaphore: DispatchSemaphore
     private let statusWriter: StatusWriter
     private(set) var didStart = false

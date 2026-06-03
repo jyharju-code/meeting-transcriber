@@ -194,10 +194,16 @@ def with_placeholders(command: list[str], output_path: Path, status_path: Path |
     }
     full_command: list[str] = []
     for part in command:
+        had_placeholder = any(token in part for token in replacements)
         for token, value in replacements.items():
             part = part.replace(token, value)
-        if part:
-            full_command.append(part)
+        if part == "":
+            # A placeholder that resolves to nothing (e.g. no status_file configured)
+            # would otherwise leave its preceding option flag dangling without a value.
+            if had_placeholder and full_command and full_command[-1].startswith("-"):
+                full_command.pop()
+            continue
+        full_command.append(part)
     return full_command
 
 

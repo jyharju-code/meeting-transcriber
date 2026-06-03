@@ -14,7 +14,6 @@ private let statusURL = runtimeRoot.appendingPathComponent("status.json")
 private let commandURL = runtimeRoot.appendingPathComponent("dashboard-command.json")
 private let configURL = appRoot.appendingPathComponent("config.json")
 private let envURL = home.appendingPathComponent(".meeting-transcriber.env")
-private let transcribeCLI = home.appendingPathComponent(".codex/skills/transcribe/scripts/transcribe_diarize.py")
 private let transcribePython = runtimeRoot.appendingPathComponent("venv/bin/python")
 
 struct RecorderStatus: Decodable {
@@ -273,11 +272,13 @@ final class DashboardModel: ObservableObject {
         "gpt-4o-transcribe",
         "gpt-4o-transcribe-diarize"
     ]
+    // Verified OpenAI chat models only. Edit this list to expose newer ones once
+    // you've confirmed they exist and work with the Responses API.
     private let summaryModels = [
         "gpt-4o-mini",
+        "gpt-4o",
         "gpt-4.1-mini",
-        "gpt-5-mini",
-        "gpt-5.4-mini"
+        "gpt-4.1"
     ]
 
     init() {

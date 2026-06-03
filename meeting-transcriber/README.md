@@ -1,163 +1,70 @@
-# Meeting Transcriber
+# Meeting Transcriber — Python Watcher & Worker
 
-Small local-first macOS meeting recorder and transcriber.
+This folder holds the two Python pieces. For full setup, the macOS permission
+trap, and the smoke test, see the [repository README](../README.md).
 
-It watches for Google Meet or Microsoft Teams calls, asks the native dashboard app
-to record system audio + microphone audio, then chunks, transcribes, and summarizes
-the recording with the OpenAI API.
+- `meeting_transcriber.py` — the LaunchAgent watcher. Polls browsers/Teams for an
+  active Meet/Teams call and, after `start_after_consecutive_detections` hits,
+  asks the dashboard app to record (or runs `record_command` directly).
+- `transcribe_recording.py` — the worker. Splits the recording into snippets with
+  `ffmpeg`, transcribes them in parallel via the OpenAI API, writes the transcript
+  in the requested format, and (optionally) a Markdown summary with action items.
 
-The point is not to be a SaaS suite. It is a narrow tool:
-
-- automatic Meet / Teams detection
-- manual Start / Stop recording
-- system audio + microphone recording through ScreenCaptureKit
-- TXT / Markdown / JSON transcript output
-- Markdown summary with action items first
-- local output folders under `~/.meeting-transcriber/output`
-
-## Consent
-
-This records audio. Follow local law, event rules, and participant expectations.
-For public broadcasts or conferences, use it like a personal note-taking recorder.
-
-## Repo Layout
-
-This project is usually published as a two-folder repo:
-
-```text
-meeting-transcriber/
-native-meeting-transcriber/
-```
-
-`meeting-transcriber/` contains the Python watcher and transcription worker.
-`native-meeting-transcriber/` contains the Swift dashboard app and native recorder.
-
-## Requirements
-
-- macOS 15+
-- Xcode Command Line Tools
-- Homebrew
-- `ffmpeg`: `brew install ffmpeg`
-- an OpenAI API key
-
-## Setup
-
-From the repo root:
+## Install
 
 ```bash
-cd meeting-transcriber
-cp config.example.json config.json
+./install_launch_agent.sh    # copies runtime to ~/.meeting-transcriber/app, makes a venv, loads the LaunchAgent
+./uninstall_launch_agent.sh  # unloads and removes the LaunchAgent
 ```
 
-Put your OpenAI key in a local env file. Do not commit this file.
+Dependencies are pinned in [`requirements.txt`](requirements.txt).
+
+## Run the worker by hand
 
 ```bash
-printf 'OPENAI_API_KEY=%q\n' 'your_api_key_here' > ~/.meeting-transcriber.env
-chmod 600 ~/.meeting-transcriber.env
+~/.meeting-transcriber/venv/bin/python transcribe_recording.py \
+  --recording ~/.meeting-transcriber/output/<job>/recording.mp4 \
+  --config config.json
 ```
 
-Build and install the native apps:
+## Tests
+
+Pure-function unit tests — no network, no macOS APIs, no OpenAI SDK required:
 
 ```bash
-cd ../native-meeting-transcriber
-./scripts/install_native_recorder.sh
-./scripts/install_dashboard.sh
+python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Open **Meeting Transcriber Dashboard.app** once and grant:
+## Config reference (`config.json`)
 
-- Screen & System Audio Recording
-- Microphone
+Copy `config.example.json` to `config.json` and edit. Keys fall back to the
+defaults shown when omitted. `~` is expanded in path values.
 
-If macOS permissions were changed, quit and reopen the dashboard app. macOS often
-does not apply ScreenCaptureKit permission changes until relaunch.
-
-Install the watcher:
-
-```bash
-cd ../meeting-transcriber
-./install_launch_agent.sh
-```
-
-The installer copies the Python runtime into `~/.meeting-transcriber/app`, creates
-`~/.meeting-transcriber/venv`, installs the OpenAI Python package, and starts the
-LaunchAgent.
-
-## Manual Test
-
-1. Open **Meeting Transcriber Dashboard.app**.
-2. Play a speech clip, podcast, or YouTube video.
-3. Click **Start**.
-4. Speak for 30 seconds or let the clip play.
-5. Click **Stop**.
-6. Open the newest folder:
-
-```bash
-open ~/.meeting-transcriber/output
-```
-
-You should see:
-
-```text
-recording.mp4
-snippets/
-transcript.txt
-transcript.md
-summary.md
-manifest.json
-progress.json
-```
-
-## Automatic Test
-
-Start a Google Meet or Teams meeting. After two watcher detections, the watcher
-writes `~/.meeting-transcriber/dashboard-command.json`; the dashboard app performs
-the actual recording because it owns the macOS Screen/System Audio permission.
-
-Close the meeting tab/window to stop automatic recording.
-
-## Why Dashboard Command Mode Exists
-
-macOS permissions are tied to the process identity. A LaunchAgent-started helper
-can be denied Screen/System Audio permission even when a manually opened app works.
-
-The stable route is:
-
-```text
-watcher detects meeting -> dashboard command file -> dashboard records -> worker transcribes
-```
-
-That avoids audio-device fiddling and avoids asking users to install BlackHole.
-
-## Costs
-
-The app uses pay-as-you-go API calls. Short false triggers under
-`min_transcribe_seconds` are skipped before any OpenAI API call.
-
-In one local test run, roughly 7,500 tokens and 22 API calls cost about $0.02.
-Your cost depends on meeting length, selected models, and summary settings.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| Dashboard asks for permission again | Grant Screen/System Audio and Microphone, then quit and reopen the dashboard. |
-| Automatic detection works but no recording starts | Keep the dashboard app running; the watcher will also try to reopen it from `/Applications`. |
-| Empty output folders | Restart the watcher; startup cleanup removes old folders with no recording or transcript. |
-| Very short recording has no transcript | Recordings under `min_transcribe_seconds` are intentionally skipped. |
-| `OPENAI_API_KEY is not set` | Check `~/.meeting-transcriber.env`. |
-| `ffmpeg` / `ffprobe` missing | Run `brew install ffmpeg`. |
-
-## Uninstall
-
-```bash
-cd meeting-transcriber
-./uninstall_launch_agent.sh
-```
-
-Then remove the installed apps if desired:
-
-```bash
-rm -rf "/Applications/Meeting Transcriber Dashboard.app"
-rm -rf "/Applications/Native Meeting Recorder.app"
-```
+| Key | Default | Purpose |
+|---|---|---|
+| `poll_seconds` | `10` | Seconds between detection passes. |
+| `start_after_consecutive_detections` | `2` | Hits in a row before recording starts (debounces false triggers). |
+| `stop_after_consecutive_misses` | `4` | Misses in a row before recording stops. |
+| `max_recording_minutes` | `180` | Hard cap on a single recording. |
+| `output_dir` | `~/.meeting-transcriber/output` | Where job folders are written. |
+| `log_file` | `~/.meeting-transcriber/meeting-transcriber.log` | Watcher log. |
+| `browser_apps` | Chrome, Edge, Brave, Arc, Safari | Browsers scanned for meeting tabs. |
+| `recording_backend` | `dashboard_command` | `dashboard_command` (recommended) or empty to use `record_command`. |
+| `dashboard_command_file` | `~/.meeting-transcriber/dashboard-command.json` | Command hand-off file the dashboard watches. |
+| `dashboard_app_path` | `/Applications/Meeting Transcriber Dashboard.app` | Dashboard app the watcher reopens if needed. |
+| `record_command` | — | Argv for the direct backend; `{output}`/`{status}` are substituted. |
+| `status_file` | `~/.meeting-transcriber/status.json` | Live recorder status (level meters, etc.). |
+| `transcribe_after_recording` | `true` | Run the worker automatically when a recording finishes. |
+| `transcribe_output_format` | `md` | `txt`, `md`, `json`, or `diarized_json`. |
+| `transcribe_model` | `gpt-4o-mini-transcribe` | Transcription model. |
+| `diarize_model` | `gpt-4o-transcribe-diarize` | Used when format is `diarized_json`. |
+| `summary` | `on` | `on`/`off` to toggle the summary step. |
+| `summary_model` | `gpt-4o-mini` | Chat model for the summary. |
+| `meeting_owner` | `""` | When set, first-person action items are attributed to this name. Empty = neutral. |
+| `meeting_owner_aliases` | `[]` | Extra names/spellings treated as the owner. |
+| `summary_max_chars` | `120000` | Transcript chars sent to the summary prompt (truncation is logged). |
+| `snippet_seconds` | `180` | Audio chunk length for transcription. |
+| `min_transcribe_seconds` | `20` | Recordings shorter than this are skipped before any API call. |
+| `max_parallel_transcriptions` | `3` | Concurrent snippet transcriptions. |
+| `orphan_job_min_age_seconds` | `180` | Age before an artifact-less job folder is swept on startup. |
+| `recorder_stop_grace_seconds` | `30` | Grace period when stopping the direct recorder. |

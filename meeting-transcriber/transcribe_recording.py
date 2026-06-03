@@ -18,6 +18,7 @@ DEFAULT_MIN_TRANSCRIBE_SECONDS = 20
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 DEFAULT_DIARIZE_MODEL = "gpt-4o-transcribe-diarize"
 DEFAULT_SUMMARY_MODEL = "gpt-4o-mini"
+DEFAULT_SUMMARY_MAX_CHARS = 120_000
 
 
 def load_config(path: Path | None) -> dict[str, Any]:
@@ -236,31 +237,78 @@ def write_transcript_outputs(job_dir: Path, requested_format: str, text: str, ch
         )
 
 
-def summarize(client: Any, job_dir: Path, text: str, summary_model: str, progress: Path | None) -> None:
+def build_summary_prompt(
+    text: str,
+    owner: str = "",
+    aliases: list[str] | None = None,
+    max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
+) -> str:
+    """Build the meeting-notes prompt.
+
+    When `owner` is set, action items spoken in the first person or by the
+    listed `aliases` are attributed to that person; otherwise the prompt stays
+    speaker-neutral. This keeps the tool free of any hard-coded identity.
+    """
+    owner = (owner or "").strip()
+    alias_list = [a.strip() for a in (aliases or []) if a and a.strip()]
+
+    owner_rules = ""
+    if owner:
+        alias_clause = ""
+        if alias_list:
+            alias_clause = (
+                f"\n- Treat these as references to {owner}: "
+                + ", ".join([owner, *alias_list, '"me"'])
+                + "."
+            )
+        owner_rules = (
+            f"\n- The meeting owner is {owner}.{alias_clause}"
+            f'\n- Include a section for {owner} if they have action items.'
+        )
+
+    intro = f"You are preparing meeting notes for {owner}." if owner else "You are preparing meeting notes."
+
+    return f"""
+{intro}
+
+Create concise Markdown meeting notes from this transcript.
+
+Rules:
+- Put ACTION ITEMS first.
+- Action items must be grouped by person when a responsible person can be inferred.{owner_rules}
+- If ownership is unclear, put it under "Unassigned".
+- After action items, include Decisions, Key Points, Risks/Open Questions, and Short Summary.
+- Do not invent facts not supported by the transcript.
+
+Transcript:
+{text[:max_chars]}
+""".strip()
+
+
+def summarize(
+    client: Any,
+    job_dir: Path,
+    text: str,
+    summary_model: str,
+    progress: Path | None,
+    owner: str = "",
+    aliases: list[str] | None = None,
+    max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
+) -> None:
     paths = output_paths(job_dir)
     write_progress(progress, stage="summarizing", progress=0.84, message="Creating summary and action items")
     if not text.strip():
         paths["summary"].write_text("# Summary\n\nNo transcript text was available.\n", encoding="utf-8")
         return
 
-    prompt = f"""
-You are preparing meeting notes for Juhana Harju.
+    if len(text) > max_chars:
+        print(
+            f"transcribe_recording: transcript is {len(text)} chars; "
+            f"truncating to {max_chars} for the summary prompt.",
+            file=sys.stderr,
+        )
 
-Create concise Markdown meeting notes from this transcript.
-
-Rules:
-- Put ACTION ITEMS first.
-- Action items must be grouped by person when a responsible person can be inferred.
-- Treat Juhana Harju, Juhana, Juhanna, "me", and the meeting owner as references to Juhana Harju.
-- If the transcript says Johanna, treat that as Juhana Harju unless the transcript clearly establishes a separate participant named Johanna.
-- Include a section for Juhana Harju / Juhana / me if he has action items.
-- If ownership is unclear, put it under "Unassigned".
-- After action items, include Decisions, Key Points, Risks/Open Questions, and Short Summary.
-- Do not invent facts not supported by the transcript.
-
-Transcript:
-{text[:120000]}
-""".strip()
+    prompt = build_summary_prompt(text, owner=owner, aliases=aliases, max_chars=max_chars)
 
     response = client.responses.create(
         model=summary_model,
@@ -302,6 +350,11 @@ def main() -> int:
     chunk_seconds = args.chunk_seconds or int(config.get("snippet_seconds", DEFAULT_CHUNK_SECONDS))
     max_parallel = int(config.get("max_parallel_transcriptions", 3))
     min_transcribe_seconds = int(config.get("min_transcribe_seconds", DEFAULT_MIN_TRANSCRIBE_SECONDS))
+    summary_owner = str(config.get("meeting_owner", "") or "")
+    summary_aliases = config.get("meeting_owner_aliases") or []
+    if not isinstance(summary_aliases, list):
+        summary_aliases = []
+    summary_max_chars = int(config.get("summary_max_chars", DEFAULT_SUMMARY_MAX_CHARS))
 
     write_progress(progress, stage="starting", progress=0.01, message="Starting transcription")
     duration = recording_duration_seconds(recording)
@@ -330,7 +383,16 @@ def main() -> int:
     )
     write_transcript_outputs(job_dir, requested_format, text, chunks, diarized_chunks)
     if summary_enabled:
-        summarize(client, job_dir, text, summary_model, progress)
+        summarize(
+            client,
+            job_dir,
+            text,
+            summary_model,
+            progress,
+            owner=summary_owner,
+            aliases=summary_aliases,
+            max_chars=summary_max_chars,
+        )
 
     manifest = {
         "recording": str(recording),

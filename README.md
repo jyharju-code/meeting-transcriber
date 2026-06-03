@@ -1,5 +1,7 @@
 # Meeting Transcriber
 
+[![CI](https://github.com/jyharju-code/meeting-transcriber/actions/workflows/ci.yml/badge.svg)](https://github.com/jyharju-code/meeting-transcriber/actions/workflows/ci.yml)
+
 Small local-first macOS meeting recorder and transcriber.
 
 It watches for Google Meet or Microsoft Teams calls, asks the native dashboard app
@@ -129,6 +131,18 @@ watcher detects meeting -> dashboard command file -> dashboard records -> worker
 
 That avoids audio-device fiddling and avoids asking users to install BlackHole.
 
+## Personalized Summaries (Optional)
+
+By default the summary is speaker-neutral. To attribute first-person action items
+to yourself, set these keys in `meeting-transcriber/config.json`:
+
+```json
+"meeting_owner": "Your Name",
+"meeting_owner_aliases": ["Nickname", "Common misspelling"]
+```
+
+Leave `meeting_owner` empty for neutral notes.
+
 ## Costs
 
 The app uses pay-as-you-go API calls. Short false triggers under
@@ -161,3 +175,19 @@ Then remove the installed apps if desired:
 rm -rf "/Applications/Meeting Transcriber Dashboard.app"
 rm -rf "/Applications/Native Meeting Recorder.app"
 ```
+
+## Development
+
+```bash
+# Python watcher/worker: byte-compile + unit tests (no network, no macOS APIs)
+cd meeting-transcriber
+python3 -m unittest discover -s tests -p "test_*.py" -v
+
+# Native apps
+cd ../native-meeting-transcriber
+swift build
+```
+
+CI runs both on every push and pull request. See
+[`meeting-transcriber/README.md`](meeting-transcriber/README.md) for the full
+config-key reference.

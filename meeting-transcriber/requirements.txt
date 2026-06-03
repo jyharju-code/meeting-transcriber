@@ -1,0 +1,3 @@
+# Runtime dependencies for the transcription worker.
+# Pinned to a floor that includes the Responses API and the gpt-4o transcribe models.
+openai>=1.50,<2

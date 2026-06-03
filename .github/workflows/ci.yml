@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: Python (watcher + worker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile
+        run: |
+          python -m py_compile \
+            meeting-transcriber/meeting_transcriber.py \
+            meeting-transcriber/transcribe_recording.py
+      - name: Unit tests
+        working-directory: meeting-transcriber
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  swift:
+    name: Swift (native apps)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        working-directory: native-meeting-transcriber
+        run: swift build

@@ -10,7 +10,7 @@ VENV="$HOME/.meeting-transcriber/venv"
 
 mkdir -p "$ROOT" "$HOME/.meeting-transcriber/output"
 
-for file in meeting_transcriber.py transcribe_recording.py run_watcher.sh uninstall_launch_agent.sh config.example.json; do
+for file in meeting_transcriber.py transcribe_recording.py run_watcher.sh uninstall_launch_agent.sh config.example.json requirements.txt; do
   cp "$SOURCE_ROOT/$file" "$ROOT/$file"
 done
 chmod +x "$ROOT/"*.sh "$ROOT/"*.py
@@ -27,7 +27,8 @@ fi
 if [[ ! -x "$VENV/bin/python" ]]; then
   /usr/bin/python3 -m venv "$VENV"
 fi
-"$VENV/bin/python" -m pip install --upgrade pip openai >/dev/null
+"$VENV/bin/python" -m pip install --upgrade pip >/dev/null
+"$VENV/bin/python" -m pip install -r "$ROOT/requirements.txt" >/dev/null
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
