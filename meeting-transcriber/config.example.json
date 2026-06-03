@@ -1,0 +1,43 @@
+{
+  "poll_seconds": 10,
+  "start_after_consecutive_detections": 2,
+  "stop_after_consecutive_misses": 4,
+  "max_recording_minutes": 180,
+  "output_dir": "~/.meeting-transcriber/output",
+  "log_file": "~/.meeting-transcriber/meeting-transcriber.log",
+  "browser_apps": [
+    "Google Chrome",
+    "Microsoft Edge",
+    "Brave Browser",
+    "Arc",
+    "Safari"
+  ],
+  "recording_backend": "dashboard_command",
+  "dashboard_command_file": "~/.meeting-transcriber/dashboard-command.json",
+  "dashboard_app_path": "/Applications/Meeting Transcriber Dashboard.app",
+  "record_command": [
+    "/Applications/Native Meeting Recorder.app/Contents/MacOS/native-meeting-recorder",
+    "--output",
+    "{output}",
+    "--status-file",
+    "{status}",
+    "--max-seconds",
+    "10800"
+  ],
+  "audio_extension": "mp4",
+  "status_file": "~/.meeting-transcriber/status.json",
+  "transcribe_after_recording": true,
+  "transcribe_python": "~/.meeting-transcriber/venv/bin/python",
+  "transcription_worker": "~/.meeting-transcriber/app/transcribe_recording.py",
+  "transcribe_output_format": "md",
+  "transcribe_model": "gpt-4o-mini-transcribe",
+  "diarize_model": "gpt-4o-transcribe-diarize",
+  "summary": "on",
+  "summary_model": "gpt-4o-mini",
+  "snippet_seconds": 180,
+  "_comment_min_transcribe_seconds": "Recordings shorter than this are skipped before any API call.",
+  "min_transcribe_seconds": 20,
+  "max_parallel_transcriptions": 3,
+  "orphan_job_min_age_seconds": 180,
+  "recorder_stop_grace_seconds": 30
+}

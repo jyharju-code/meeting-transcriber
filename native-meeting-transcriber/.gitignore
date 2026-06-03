@@ -1,0 +1,6 @@
+.DS_Store
+.build/
+*.log
+*.mp4
+*.m4a
+*.wav

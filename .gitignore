@@ -1,0 +1,9 @@
+.DS_Store
+*.log
+*.mp4
+*.m4a
+*.wav
+config.json
+.build/
+__pycache__/
+*.pyc
