@@ -7,8 +7,32 @@ trap, and the smoke test, see the [repository README](../README.md).
   active Meet/Teams call and, after `start_after_consecutive_detections` hits,
   asks the dashboard app to record (or runs `record_command` directly).
 - `transcribe_recording.py` — the worker. Splits the recording into snippets with
-  `ffmpeg`, transcribes them in parallel via the OpenAI API, writes the transcript
-  in the requested format, and (optionally) a Markdown summary with action items.
+  `ffmpeg`, transcribes them via the selected provider, writes the transcript in
+  the requested format, and (optionally) a Markdown summary with action items.
+- `providers.py` — pluggable transcription/summary providers (see below).
+
+## Engines (providers)
+
+Transcription and summarization are provider-agnostic.
+
+- **Transcription floor:** local **whisper.cpp** (`large-v3-turbo` by default) —
+  no API key, no network once the model is cached. Install with
+  [`./install_whisper.sh`](install_whisper.sh) (`brew install whisper-cpp` + model
+  download). API transcription (OpenAI, or any OpenAI-compatible audio endpoint
+  like Groq) unlocks by setting its key.
+- **Summaries:** any **OpenAI-compatible** `/chat/completions` endpoint, chosen by
+  config alone — OpenAI, **OpenRouter** (→ Claude, Gemini, Llama, Mistral, …),
+  Groq, or a local Ollama server. No extra Python dependencies.
+
+`transcribe_provider` / `summary_provider` pick the primary; `*_fallback` lists are
+tried in order, then any other available provider, ending at the local floor. Keys
+live in `~/.meeting-transcriber.env` (one `NAME=value` per line), never in
+`config.json`.
+
+> **v1 note:** provider selection is via `config.json`. The dashboard's model
+> pickers still write the legacy top-level `transcribe_model`/`summary_model` keys,
+> which apply only when no `providers` block is present. A dashboard provider
+> picker is a follow-up.
 
 ## Install
 
@@ -55,11 +79,17 @@ defaults shown when omitted. `~` is expanded in path values.
 | `record_command` | — | Argv for the direct backend; `{output}`/`{status}` are substituted. |
 | `status_file` | `~/.meeting-transcriber/status.json` | Live recorder status (level meters, etc.). |
 | `transcribe_after_recording` | `true` | Run the worker automatically when a recording finishes. |
-| `transcribe_output_format` | `md` | `txt`, `md`, `json`, or `diarized_json`. |
-| `transcribe_model` | `gpt-4o-mini-transcribe` | Transcription model. |
-| `diarize_model` | `gpt-4o-transcribe-diarize` | Used when format is `diarized_json`. |
+| `transcribe_output_format` | `md` | `txt`, `md`, `json`, or `diarized_json` (diarized needs a diarization-capable provider; otherwise degrades to `json`). |
+| `transcribe_provider` | `local_whisper`¹ | Primary transcription provider name. |
+| `transcribe_fallback` | `["openai"]` | Providers tried if the primary is unavailable. |
+| `summary_provider` | `openai` | Primary summary provider name. |
+| `summary_fallback` | `["openrouter"]` | Providers tried if the primary is unavailable. |
+| `providers` | see example | Registry: each entry may have a `transcribe` and/or `summarize` block. |
+| `models_dir` | `~/.meeting-transcriber/models` | Where Whisper models are cached. |
+| `whisper_auto_download` | `true` | Fetch the Whisper model on first use if missing. |
+| `whisper_language` | `auto` | Whisper language hint (`auto`, `en`, `fi`, …). |
 | `summary` | `on` | `on`/`off` to toggle the summary step. |
-| `summary_model` | `gpt-4o-mini` | Chat model for the summary. |
+| `transcribe_model` / `diarize_model` / `summary_model` | — | **Legacy.** Used only when no `providers` block is present. |
 | `meeting_owner` | `""` | When set, first-person action items are attributed to this name. Empty = neutral. |
 | `meeting_owner_aliases` | `[]` | Extra names/spellings treated as the owner. |
 | `summary_max_chars` | `120000` | Transcript chars sent to the summary prompt (truncation is logged). |
@@ -68,3 +98,6 @@ defaults shown when omitted. `~` is expanded in path values.
 | `max_parallel_transcriptions` | `3` | Concurrent snippet transcriptions. |
 | `orphan_job_min_age_seconds` | `180` | Age before an artifact-less job folder is swept on startup. |
 | `recorder_stop_grace_seconds` | `30` | Grace period when stopping the direct recorder. |
+
+¹ Legacy configs with no `provider`/`transcribe_provider` keys default to `openai`
+so existing setups keep their current behavior.

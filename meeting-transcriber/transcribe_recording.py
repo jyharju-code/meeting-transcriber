@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import providers
+
 
 DEFAULT_CHUNK_SECONDS = 180
 DEFAULT_MIN_TRANSCRIBE_SECONDS = 20
@@ -33,12 +35,6 @@ def write_progress(path: Path | None, **payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
-
-def openai_client():
-    from openai import OpenAI
-
-    return OpenAI()
 
 
 def output_paths(job_dir: Path) -> dict[str, Path]:
@@ -144,12 +140,9 @@ def result_jsonable(result: Any) -> Any:
 
 
 def transcribe_snippets(
-    client: Any,
+    transcriber: "providers.Transcriber",
     snippets: list[Path],
     job_dir: Path,
-    requested_format: str,
-    transcribe_model: str,
-    diarize_model: str,
     max_parallel: int,
     progress: Path | None,
 ) -> tuple[str, list[dict[str, Any]], list[Any]]:
@@ -159,25 +152,17 @@ def transcribe_snippets(
     json_chunks: list[dict[str, Any]] = []
     diarized_chunks: list[Any] = []
 
-    use_diarized = requested_format == "diarized_json"
-    model = diarize_model if use_diarized else transcribe_model
-    response_format = "diarized_json" if use_diarized else "json"
+    use_diarized = bool(getattr(transcriber, "diarize", False))
+    effective_parallel = max(1, min(max_parallel, getattr(transcriber, "max_parallel", max_parallel)))
 
     def transcribe_one(index: int, snippet: Path) -> dict[str, Any]:
-        with snippet.open("rb") as audio_file:
-            result = client.audio.transcriptions.create(
-                file=audio_file,
-                model=model,
-                response_format=response_format,
-        )
-        data = result_jsonable(result)
-        text = transcript_text(result)
+        text, raw = transcriber.transcribe(snippet)
         payload: dict[str, Any] = {
             "index": index,
             "file": str(snippet),
-            "model": model,
+            "model": transcriber.model_label,
             "text": text,
-            "raw": data,
+            "raw": raw,
         }
         (snippet_transcript_dir / f"{snippet.stem}.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False),
@@ -187,7 +172,7 @@ def transcribe_snippets(
 
     payloads: dict[int, dict[str, Any]] = {}
     completed = 0
-    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+    with ThreadPoolExecutor(max_workers=effective_parallel) as pool:
         futures = {
             pool.submit(transcribe_one, index, snippet): (index, snippet)
             for index, snippet in enumerate(snippets, start=1)
@@ -286,10 +271,9 @@ Transcript:
 
 
 def summarize(
-    client: Any,
+    summarizer: "providers.Summarizer | None",
     job_dir: Path,
     text: str,
-    summary_model: str,
     progress: Path | None,
     owner: str = "",
     aliases: list[str] | None = None,
@@ -301,6 +285,15 @@ def summarize(
         paths["summary"].write_text("# Summary\n\nNo transcript text was available.\n", encoding="utf-8")
         return
 
+    if summarizer is None:
+        paths["summary"].write_text(
+            "# Summary\n\nNo summary provider was available (no API key set and no "
+            "local LLM configured). The full transcript is in this folder.\n",
+            encoding="utf-8",
+        )
+        print("transcribe_recording: no summary provider available; wrote placeholder", file=sys.stderr)
+        return
+
     if len(text) > max_chars:
         print(
             f"transcribe_recording: transcript is {len(text)} chars; "
@@ -309,12 +302,7 @@ def summarize(
         )
 
     prompt = build_summary_prompt(text, owner=owner, aliases=aliases, max_chars=max_chars)
-
-    response = client.responses.create(
-        model=summary_model,
-        input=prompt,
-    )
-    summary = getattr(response, "output_text", None) or str(response)
+    summary = summarizer.summarize(prompt)
     if not summary.lstrip().startswith("#"):
         summary = "# Meeting Summary\n\n" + summary
     paths["summary"].write_text(summary.strip() + "\n", encoding="utf-8")
@@ -340,12 +328,20 @@ def main() -> int:
     paths = output_paths(job_dir)
     progress = Path(args.progress).expanduser() if args.progress else paths["progress"]
 
+    # CLI flags override config for the legacy/default provider registry.
+    if args.transcribe_model:
+        config["transcribe_model"] = args.transcribe_model
+    if args.diarize_model:
+        config["diarize_model"] = args.diarize_model
+    if args.summary_model:
+        config["summary_model"] = args.summary_model
+    if args.format:
+        config["transcribe_output_format"] = args.format
+
     requested_format = args.format or config.get("transcribe_output_format") or "txt"
     if requested_format == "text":
         requested_format = "txt"
-    transcribe_model = args.transcribe_model or config.get("transcribe_model") or DEFAULT_TRANSCRIBE_MODEL
-    diarize_model = args.diarize_model or config.get("diarize_model") or DEFAULT_DIARIZE_MODEL
-    summary_model = args.summary_model or config.get("summary_model") or DEFAULT_SUMMARY_MODEL
+    config["transcribe_output_format"] = requested_format
     summary_enabled = (args.summary or config.get("summary", "on")) != "off"
     chunk_seconds = args.chunk_seconds or int(config.get("snippet_seconds", DEFAULT_CHUNK_SECONDS))
     max_parallel = int(config.get("max_parallel_transcriptions", 3))
@@ -369,25 +365,64 @@ def main() -> int:
         )
         return 0
 
-    client = openai_client()
+    transcribers = providers.build_transcribers(config)
+    transcriber = providers.select(
+        transcribers,
+        config.get("transcribe_provider", "openai"),
+        config.get("transcribe_fallback", ["local_whisper"]),
+    )
+    if transcriber is None:
+        message = (
+            "No transcription provider available. Set an API key (e.g. OPENAI_API_KEY) "
+            "or install local Whisper with ./install_whisper.sh."
+        )
+        write_progress(progress, stage="error", progress=1.0, message=message)
+        print(f"transcribe_recording: {message}", file=sys.stderr)
+        return 1
+
+    # Diarized output needs a diarization-capable transcriber; otherwise degrade.
+    if requested_format == "diarized_json" and not getattr(transcriber, "supports_diarization", False):
+        print(
+            f"transcribe_recording: provider '{transcriber.name}' does not support "
+            "diarization; writing plain json instead.",
+            file=sys.stderr,
+        )
+        requested_format = "json"
+
+    try:
+        transcriber.prepare()
+    except providers.ProviderError as exc:
+        write_progress(progress, stage="error", progress=1.0, message=str(exc))
+        print(f"transcribe_recording: {exc}", file=sys.stderr)
+        return 1
+
+    summarizer = None
+    if summary_enabled:
+        summarizers = providers.build_summarizers(config)
+        summarizer = providers.select(
+            summarizers,
+            config.get("summary_provider", "openai"),
+            config.get("summary_fallback", []),
+        )
+
+    write_progress(
+        progress, stage="starting", progress=0.02,
+        message=f"Transcribing with {transcriber.model_label}",
+    )
     snippets = split_snippets(recording, job_dir / "snippets", chunk_seconds, progress)
     text, chunks, diarized_chunks = transcribe_snippets(
-        client,
+        transcriber,
         snippets,
         job_dir,
-        requested_format,
-        transcribe_model,
-        diarize_model,
         max_parallel,
         progress,
     )
     write_transcript_outputs(job_dir, requested_format, text, chunks, diarized_chunks)
     if summary_enabled:
         summarize(
-            client,
+            summarizer,
             job_dir,
             text,
-            summary_model,
             progress,
             owner=summary_owner,
             aliases=summary_aliases,
@@ -397,9 +432,11 @@ def main() -> int:
     manifest = {
         "recording": str(recording),
         "format": requested_format,
-        "transcribe_model": diarize_model if requested_format == "diarized_json" else transcribe_model,
-        "summary_model": summary_model if summary_enabled else None,
-        "summary": summary_enabled,
+        "transcribe_provider": transcriber.name,
+        "transcribe_model": transcriber.model_label,
+        "summary_provider": summarizer.name if summarizer else None,
+        "summary_model": summarizer.model_label if summarizer else None,
+        "summary": summary_enabled and summarizer is not None,
         "snippets": [str(path) for path in snippets],
         "outputs": {name: str(path) for name, path in paths.items() if path.exists()},
     }

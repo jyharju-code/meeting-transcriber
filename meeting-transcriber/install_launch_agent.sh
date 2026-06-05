@@ -10,7 +10,7 @@ VENV="$HOME/.meeting-transcriber/venv"
 
 mkdir -p "$ROOT" "$HOME/.meeting-transcriber/output"
 
-for file in meeting_transcriber.py transcribe_recording.py run_watcher.sh uninstall_launch_agent.sh config.example.json requirements.txt; do
+for file in meeting_transcriber.py transcribe_recording.py providers.py run_watcher.sh uninstall_launch_agent.sh install_whisper.sh config.example.json requirements.txt; do
   cp "$SOURCE_ROOT/$file" "$ROOT/$file"
 done
 chmod +x "$ROOT/"*.sh "$ROOT/"*.py

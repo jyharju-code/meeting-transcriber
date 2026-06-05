@@ -30,10 +30,37 @@
   "transcribe_python": "~/.meeting-transcriber/venv/bin/python",
   "transcription_worker": "~/.meeting-transcriber/app/transcribe_recording.py",
   "transcribe_output_format": "md",
-  "transcribe_model": "gpt-4o-mini-transcribe",
-  "diarize_model": "gpt-4o-transcribe-diarize",
+
+  "_comment_providers": "Local Whisper is the always-available floor. API providers unlock by setting their key env var. transcribe_provider/summary_provider pick the primary; *_fallback lists are tried in order, then any other available provider, ending at the local floor.",
+  "transcribe_provider": "local_whisper",
+  "transcribe_fallback": ["openai"],
+  "summary_provider": "openai",
+  "summary_fallback": ["openrouter"],
+  "models_dir": "~/.meeting-transcriber/models",
+  "whisper_auto_download": true,
+  "whisper_language": "auto",
+  "providers": {
+    "local_whisper": {
+      "transcribe": {
+        "type": "whisper_cpp",
+        "model": "large-v3-turbo-q5_0",
+        "model_url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
+      }
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "key_env": "OPENAI_API_KEY",
+      "transcribe": { "type": "openai_audio", "model": "gpt-4o-mini-transcribe", "diarize_model": "gpt-4o-transcribe-diarize" },
+      "summarize": { "type": "openai_chat", "model": "gpt-4o-mini" }
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "key_env": "OPENROUTER_API_KEY",
+      "summarize": { "type": "openai_chat", "model": "anthropic/claude-3.5-sonnet" }
+    }
+  },
+
   "summary": "on",
-  "summary_model": "gpt-4o-mini",
   "_comment_meeting_owner": "Optional. When set, first-person action items are attributed to this name. Leave empty for speaker-neutral notes.",
   "meeting_owner": "",
   "meeting_owner_aliases": [],

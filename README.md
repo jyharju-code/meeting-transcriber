@@ -16,6 +16,22 @@ The point is not to be a SaaS suite. It is a narrow tool:
 - TXT / Markdown / JSON transcript output
 - Markdown summary with action items first
 - local output folders under `~/.meeting-transcriber/output`
+- **pluggable engines**: local Whisper floor + bring-your-own-key for any provider
+
+## Engines
+
+Transcription and summarization are provider-agnostic:
+
+- **Transcription** defaults to a fully local **whisper.cpp** floor (no key, no
+  network once cached). Install it with `meeting-transcriber/install_whisper.sh`.
+  OpenAI (or any OpenAI-compatible audio API) unlocks by setting its key.
+- **Summaries** run through any **OpenAI-compatible** chat endpoint — OpenAI,
+  **OpenRouter** (→ Claude, Gemini, Llama, Mistral, …), Groq, or a local Ollama
+  server — chosen by config alone, no extra dependencies.
+
+You pick providers (and a fallback chain ending at the local floor) in
+`config.json`; see [`meeting-transcriber/README.md`](meeting-transcriber/README.md).
+With no API keys at all, recording + local transcription still work end-to-end.
 
 ## Consent
 
@@ -40,7 +56,9 @@ native-meeting-transcriber/
 - Xcode Command Line Tools
 - Homebrew
 - `ffmpeg`: `brew install ffmpeg`
-- an OpenAI API key
+- **for local transcription:** `whisper-cpp` + a model — run
+  `meeting-transcriber/install_whisper.sh`
+- **for API providers (optional):** a key for OpenAI and/or OpenRouter, etc.
 
 ## Setup
 
@@ -51,11 +69,24 @@ cd meeting-transcriber
 cp config.example.json config.json
 ```
 
-Put your OpenAI key in a local env file. Do not commit this file.
+Put any provider keys in a local env file, one per line. Do not commit this file.
+Keys are optional — with none set, recording + local Whisper transcription still
+work. Add only the providers you want:
 
 ```bash
-printf 'OPENAI_API_KEY=%q\n' 'your_api_key_here' > ~/.meeting-transcriber.env
+umask 077
+cat > ~/.meeting-transcriber.env <<'ENV'
+OPENAI_API_KEY=your_openai_key_here
+# OPENROUTER_API_KEY=your_openrouter_key_here
+ENV
 chmod 600 ~/.meeting-transcriber.env
+```
+
+(Optional) install the local Whisper floor so transcription works with no keys:
+
+```bash
+cd meeting-transcriber
+./install_whisper.sh        # brew install whisper-cpp + downloads the model
 ```
 
 Build and install the native apps:
@@ -82,7 +113,7 @@ cd ../meeting-transcriber
 ```
 
 The installer copies the Python runtime into `~/.meeting-transcriber/app`, creates
-`~/.meeting-transcriber/venv`, installs the OpenAI Python package, and starts the
+`~/.meeting-transcriber/venv`, installs the pinned dependencies, and starts the
 LaunchAgent.
 
 ## Manual Test

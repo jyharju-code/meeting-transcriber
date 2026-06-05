@@ -535,9 +535,8 @@ final class DashboardModel: ObservableObject {
     }
 
     private func transcribe(url: URL) {
-        guard FileManager.default.fileExists(atPath: transcribePython.path),
-              let apiKey = loadAPIKey(), !apiKey.isEmpty else {
-            message = "Recording saved; API key missing for transcription"
+        guard FileManager.default.fileExists(atPath: transcribePython.path) else {
+            message = "Recording saved; Python runtime missing (run install_launch_agent.sh)"
             return
         }
 
@@ -556,7 +555,10 @@ final class DashboardModel: ObservableObject {
             "--recording", url.path,
             "--config", configURL.path,
         ]
-        process.environment = ProcessInfo.processInfo.environment.merging(["OPENAI_API_KEY": apiKey]) { _, new in new }
+        // Forward every key from the env file so any configured provider works
+        // (OpenAI, OpenRouter, ...). Local Whisper needs no key at all, so we do
+        // not block transcription when no key is present.
+        process.environment = ProcessInfo.processInfo.environment.merging(loadEnv()) { _, new in new }
         process.terminationHandler = { [weak self] finished in
             Task { @MainActor in
                 self?.message = finished.terminationStatus == 0 ? "Transcript and summary saved" : "Transcription failed"
@@ -572,15 +574,22 @@ final class DashboardModel: ObservableObject {
         }
     }
 
-    private func loadAPIKey() -> String? {
-        guard let text = try? String(contentsOf: envURL, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n") {
+    private func loadEnv() -> [String: String] {
+        guard let text = try? String(contentsOf: envURL, encoding: .utf8) else { return [:] }
+        var env: [String: String] = [:]
+        for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("OPENAI_API_KEY=") {
-                return String(trimmed.dropFirst("OPENAI_API_KEY=".count))
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            guard let eq = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces)
+            var value = String(trimmed[trimmed.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if value.count >= 2,
+               (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
             }
+            if !key.isEmpty { env[key] = value }
         }
-        return nil
+        return env
     }
 
     private func readProgress(activeOutput: String) {
