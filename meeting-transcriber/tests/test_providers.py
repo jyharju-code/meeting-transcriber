@@ -135,5 +135,70 @@ class RegistryBuildTests(unittest.TestCase):
         self.assertEqual(providers.build_transcribers(config), {})
 
 
+class GeminiTests(unittest.TestCase):
+    def test_looks_degenerate_detects_token_loop(self):
+        self.assertTrue(providers.gemini_looks_degenerate("mutta " * 60))
+        self.assertFalse(providers.gemini_looks_degenerate("Tämä on ihan tavallinen suomenkielinen virke joka jatkuu eteenpäin."))
+        self.assertFalse(providers.gemini_looks_degenerate("mutta mutta"))  # too short to judge
+
+    def test_key_env_precedence(self):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g", "GOOGLE_API_KEY": "x"}, clear=True):
+            self.assertEqual(providers.gemini_key(), "g")
+        with mock.patch.dict(os.environ, {"GOOGLE_API_KEY": "x"}, clear=True):
+            self.assertEqual(providers.gemini_key(), "x")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(providers.gemini_key())
+
+    def test_transcriber_available_requires_key(self):
+        t = providers.GeminiTranscriber("gemini")
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g"}, clear=True):
+            self.assertTrue(t.available())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(t.available())
+
+    def test_summarizer_available_requires_key(self):
+        s = providers.GeminiSummarizer("gemini")
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g"}, clear=True):
+            self.assertTrue(s.available())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(s.available())
+
+    def test_hybrid_wiring_defaults(self):
+        t = providers.GeminiTranscriber("gemini")
+        self.assertEqual(t.model, "gemini-3.5-transcribe")
+        self.assertEqual(t.fallback_model, "gemini-3.5-flash")
+
+    def test_default_registry_includes_gemini(self):
+        self.assertIsInstance(providers.build_transcribers({}).get("gemini"), providers.GeminiTranscriber)
+        self.assertIsInstance(providers.build_summarizers({}).get("gemini"), providers.GeminiSummarizer)
+
+    def test_explicit_gemini_block(self):
+        config = {
+            "providers": {
+                "gemini": {
+                    "key_env": "GEMINI_API_KEY",
+                    "transcribe": {"type": "gemini", "model": "gemini-3.5-flash", "fallback_model": ""},
+                    "summarize": {"type": "gemini", "model": "gemini-3.5-flash"},
+                }
+            }
+        }
+        t = providers.build_transcribers(config)["gemini"]
+        self.assertEqual(t.model, "gemini-3.5-flash")
+        self.assertEqual(t.fallback_model, "")
+        self.assertEqual(providers.build_summarizers(config)["gemini"].model, "gemini-3.5-flash")
+
+
+class SummaryLanguageTests(unittest.TestCase):
+    def test_auto_language_directive(self):
+        import transcribe_recording as tr
+        prompt = tr.build_summary_prompt("Tämä on suomea.", language="auto")
+        self.assertIn("SAME LANGUAGE", prompt)
+
+    def test_forced_language_directive(self):
+        import transcribe_recording as tr
+        prompt = tr.build_summary_prompt("Some text.", language="Finnish")
+        self.assertIn("in Finnish", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

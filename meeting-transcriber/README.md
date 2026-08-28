@@ -23,6 +23,15 @@ Transcription and summarization are provider-agnostic.
 - **Summaries:** any **OpenAI-compatible** `/chat/completions` endpoint, chosen by
   config alone — OpenAI, **OpenRouter** (→ Claude, Gemini, Llama, Mistral, …),
   Groq, or a local Ollama server. No extra Python dependencies.
+- **Google Gemini** (native, `GEMINI_API_KEY`): **0 EUR on the AI Studio free tier**
+  (Google may use the audio to improve its products). Transcription is a per-snippet
+  hybrid — the dedicated `gemini-3.5-transcribe` (via `/v1beta/interactions`, not
+  `generateContent`) with automatic fallback to `gemini-3.5-flash` on empty/looping
+  output; summaries run on `gemini-3.5-flash`. Select with
+  `transcribe_provider`/`summary_provider: "gemini"`.
+
+Summaries follow `summary_language`: `auto` (default) writes the notes in the same
+language as the transcript, with localized headings; or force a language by name.
 
 `transcribe_provider` / `summary_provider` pick the primary; `*_fallback` lists are
 tried in order, then any other available provider, ending at the local floor. Keys

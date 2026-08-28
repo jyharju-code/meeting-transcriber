@@ -57,10 +57,18 @@
       "base_url": "https://openrouter.ai/api/v1",
       "key_env": "OPENROUTER_API_KEY",
       "summarize": { "type": "openai_chat", "model": "anthropic/claude-3.5-sonnet" }
+    },
+    "gemini": {
+      "_comment": "Google Gemini. 0 EUR on the AI Studio free tier (Google may use the audio to improve its products). Transcription is a per-snippet hybrid: gemini-3.5-transcribe first, falling back to fallback_model on empty/looping output.",
+      "key_env": "GEMINI_API_KEY",
+      "transcribe": { "type": "gemini", "model": "gemini-3.5-transcribe", "fallback_model": "gemini-3.5-flash", "mode": "smart", "language_codes": ["fi-FI"] },
+      "summarize": { "type": "gemini", "model": "gemini-3.5-flash" }
     }
   },
 
   "summary": "on",
+  "_comment_summary_language": "auto = write the notes in the same language as the transcript (Finnish meeting -> Finnish notes). Or force a language by name, e.g. \"Finnish\" / \"English\".",
+  "summary_language": "auto",
   "_comment_meeting_owner": "Optional. When set, first-person action items are attributed to this name. Leave empty for speaker-neutral notes.",
   "meeting_owner": "",
   "meeting_owner_aliases": [],

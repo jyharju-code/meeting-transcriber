@@ -16,11 +16,14 @@ its unit tests) import cleanly without the package installed.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +34,13 @@ DEFAULT_WHISPER_MODEL_URL = (
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
     "ggml-large-v3-turbo-q5_0.bin"
 )
+
+# Google Gemini (AI Studio). Free tier is 0 EUR in exchange for Google using the
+# submitted audio/text to improve its products.
+GEMINI_BASE = "https://generativelanguage.googleapis.com"
+GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
+GEMINI_FALLBACK_MODEL = "gemini-3.5-flash"
+GEMINI_KEY_ENVS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 
 class ProviderError(RuntimeError):
@@ -59,6 +69,126 @@ def _result_jsonable(result: Any) -> Any:
     if isinstance(result, (dict, list)):
         return result
     return {"text": _result_text(result)}
+
+
+# --------------------------------------------------------------------------- #
+# Google Gemini helpers (stdlib urllib; no extra dependency)
+# --------------------------------------------------------------------------- #
+
+def gemini_key(key_env: str | None = None) -> str | None:
+    for env in ([key_env] if key_env else GEMINI_KEY_ENVS):
+        value = os.environ.get(env) if env else None
+        if value:
+            return value
+    return None
+
+
+def gemini_http(req: "urllib.request.Request", timeout: int, attempts: int = 6) -> bytes:
+    """Send a request, retrying on 429/5xx with exponential backoff.
+
+    The free tier rate-limits gemini-3.5-transcribe fairly tightly, so transient
+    429s are expected under load; back off and retry rather than failing the job.
+    """
+    import urllib.error
+
+    delay = 8.0
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 503) and attempt < attempts - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 90.0)
+                continue
+            raise
+
+
+def gemini_looks_degenerate(text: str) -> bool:
+    """Detect ASR collapse where one token repeats consecutively many times."""
+    words = text.split()
+    if len(words) < 40:
+        return False
+    run = best = 1
+    for a, b in zip(words, words[1:]):
+        run = run + 1 if a == b else 1
+        best = max(best, run)
+    return best >= 25
+
+
+def gemini_upload_file(api_key: str, path: Path, mime: str) -> str:
+    data = path.read_bytes()
+    req = urllib.request.Request(
+        f"{GEMINI_BASE}/upload/v1beta/files?key={api_key}",
+        data=data,
+        headers={
+            "X-Goog-Upload-Command": "start, upload, finalize",
+            "X-Goog-Upload-Header-Content-Length": str(len(data)),
+            "X-Goog-Upload-Header-Content-Type": mime,
+            "Content-Type": mime,
+        },
+    )
+    return json.loads(gemini_http(req, timeout=300).decode("utf-8"))["file"]["uri"]
+
+
+def gemini_transcribe_interactions(api_key, file_uri, mime, language_codes, mode) -> str:
+    """Dedicated gemini-3.5-transcribe via the Interactions API."""
+    body = {
+        "model": GEMINI_TRANSCRIBE_MODEL,
+        "input": [{"type": "audio", "uri": file_uri, "mime_type": mime}],
+        "generation_config": {"transcription_config": {"language_codes": language_codes, "mode": mode}},
+    }
+    req = urllib.request.Request(
+        f"{GEMINI_BASE}/v1beta/interactions?key={api_key}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    data = json.loads(gemini_http(req, timeout=600).decode("utf-8"))
+    parts = [
+        content["text"]
+        for step in data.get("steps", []) if step.get("type") == "model_output"
+        for content in step.get("content", []) if content.get("type") == "text" and content.get("text")
+    ]
+    return "".join(parts).strip()
+
+
+def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model) -> str:
+    """General multimodal model (e.g. gemini-3.5-flash) via generateContent."""
+    langs = ", ".join(language_codes) if language_codes else "the spoken language"
+    prompt = (
+        f"Transcribe this meeting audio verbatim into clean text in {langs}. "
+        "Output only the transcript, with no timestamps, speaker labels, or commentary."
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime, "file_uri": file_uri}}]}],
+        "generationConfig": {"temperature": 0},
+    }
+    req = urllib.request.Request(
+        f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={api_key}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    data = json.loads(gemini_http(req, timeout=600).decode("utf-8"))
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+def gemini_generate_text(api_key: str, model: str, prompt: str) -> str:
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}
+    req = urllib.request.Request(
+        f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={api_key}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    data = json.loads(gemini_http(req, timeout=600).decode("utf-8"))
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +354,73 @@ class WhisperCppTranscriber(Transcriber):
             return text, {"text": text, "engine": self.model_label}
 
 
+class GeminiTranscriber(Transcriber):
+    """Google Gemini transcription with a per-snippet hybrid.
+
+    Each snippet is tried with `model` first (default gemini-3.5-transcribe, the
+    dedicated ASR model reached via the Interactions API) and falls back to
+    `fallback_model` (default gemini-3.5-flash via generateContent) when the
+    dedicated model returns empty output or a token-loop collapse, which it can do
+    on the free tier. Snippets are the worker's ~180 s chunks, well within the
+    dedicated model's reliable range.
+    """
+
+    max_parallel = 2  # keep the free-tier transcribe rate limit happy
+
+    def __init__(self, name, model=None, fallback_model=GEMINI_FALLBACK_MODEL,
+                 mode="smart", language_codes=None, key_env=None, ffmpeg="ffmpeg"):
+        self.name = name
+        self.model = model or GEMINI_TRANSCRIBE_MODEL
+        self.fallback_model = fallback_model or ""
+        self.mode = mode or "smart"
+        self.language_codes = language_codes or ["fi-FI"]
+        self.key_env = key_env
+        self.ffmpeg = ffmpeg
+        self.model_label = self.model
+
+    def available(self) -> bool:
+        return bool(gemini_key(self.key_env))
+
+    def _to_flac(self, snippet: Path, out_dir: Path) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        flac = out_dir / f"{snippet.stem}.flac"
+        if flac.exists():
+            return flac
+        result = subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-y", "-i", str(snippet),
+             "-ac", "1", "-ar", "16000", "-c:a", "flac", str(flac)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise ProviderError(result.stderr.strip() or "ffmpeg FLAC conversion failed")
+        return flac
+
+    def _run(self, api_key: str, file_uri: str, model: str) -> str:
+        if model == GEMINI_TRANSCRIBE_MODEL:
+            return gemini_transcribe_interactions(api_key, file_uri, "audio/flac", self.language_codes, self.mode)
+        return gemini_transcribe_generate(api_key, file_uri, "audio/flac", self.language_codes, model)
+
+    def transcribe(self, snippet: Path) -> tuple[str, Any]:
+        api_key = gemini_key(self.key_env)
+        if not api_key:
+            raise ProviderError(f"No Gemini API key set for provider '{self.name}'")
+        flac = self._to_flac(snippet, snippet.parent / "gemini-flac")
+        attempts = [self.model, self.model]
+        if self.fallback_model and self.fallback_model != self.model:
+            attempts.append(self.fallback_model)
+        text = ""
+        used = "none"
+        for model in attempts:
+            file_uri = gemini_upload_file(api_key, flac, "audio/flac")
+            candidate = self._run(api_key, file_uri, model)
+            if candidate and not gemini_looks_degenerate(candidate):
+                text, used = candidate, model
+                break
+        if not text:
+            print(f"providers: Gemini produced no usable transcript for {snippet.name}", file=sys.stderr)
+        return text, {"text": text, "model": used, "engine": f"gemini:{used}"}
+
+
 # --------------------------------------------------------------------------- #
 # Summarization
 # --------------------------------------------------------------------------- #
@@ -285,6 +482,25 @@ class OpenAIChatSummarizer(Summarizer):
         return (response.choices[0].message.content or "").strip()
 
 
+class GeminiSummarizer(Summarizer):
+    """Google Gemini summaries via generateContent (no OpenAI SDK needed)."""
+
+    def __init__(self, name, model=GEMINI_FALLBACK_MODEL, key_env=None):
+        self.name = name
+        self.model = model or GEMINI_FALLBACK_MODEL
+        self.model_label = self.model
+        self.key_env = key_env
+
+    def available(self) -> bool:
+        return bool(gemini_key(self.key_env))
+
+    def summarize(self, prompt: str) -> str:
+        api_key = gemini_key(self.key_env)
+        if not api_key:
+            raise ProviderError(f"No Gemini API key set for provider '{self.name}'")
+        return gemini_generate_text(api_key, self.model, prompt)
+
+
 # --------------------------------------------------------------------------- #
 # Registry + selection
 # --------------------------------------------------------------------------- #
@@ -314,6 +530,20 @@ def default_providers(config: dict[str, Any]) -> dict[str, Any]:
             "summarize": {
                 "type": "openai_chat",
                 "model": config.get("summary_model", "gpt-4o-mini"),
+            },
+        },
+        "gemini": {
+            "key_env": "GEMINI_API_KEY",
+            "transcribe": {
+                "type": "gemini",
+                "model": config.get("gemini_transcribe_model", GEMINI_TRANSCRIBE_MODEL),
+                "fallback_model": config.get("gemini_transcribe_fallback_model", GEMINI_FALLBACK_MODEL),
+                "mode": config.get("gemini_transcribe_mode", "smart"),
+                "language_codes": config.get("gemini_language_codes", ["fi-FI"]),
+            },
+            "summarize": {
+                "type": "gemini",
+                "model": config.get("gemini_summary_model", GEMINI_FALLBACK_MODEL),
             },
         },
     }
@@ -352,6 +582,16 @@ def build_transcribers(config: dict[str, Any]) -> dict[str, Transcriber]:
                 diarize=diarize,
                 max_parallel=max_parallel,
             )
+        elif kind == "gemini":
+            out[name] = GeminiTranscriber(
+                name=name,
+                model=block.get("model", GEMINI_TRANSCRIBE_MODEL),
+                fallback_model=block.get("fallback_model", GEMINI_FALLBACK_MODEL),
+                mode=block.get("mode", "smart"),
+                language_codes=block.get("language_codes", ["fi-FI"]),
+                key_env=spec.get("key_env"),
+                ffmpeg=ffmpeg_path(config),
+            )
     return out
 
 
@@ -369,6 +609,12 @@ def build_summarizers(config: dict[str, Any]) -> dict[str, Summarizer]:
                 key_env=spec.get("key_env"),
                 model=block.get("model", "gpt-4o-mini"),
                 extra_headers=spec.get("extra_headers"),
+            )
+        elif block.get("type") == "gemini":
+            out[name] = GeminiSummarizer(
+                name=name,
+                model=block.get("model", GEMINI_FALLBACK_MODEL),
+                key_env=spec.get("key_env"),
             )
     return out
 

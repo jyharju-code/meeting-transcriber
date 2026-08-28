@@ -227,6 +227,7 @@ def build_summary_prompt(
     owner: str = "",
     aliases: list[str] | None = None,
     max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
+    language: str = "auto",
 ) -> str:
     """Build the meeting-notes prompt.
 
@@ -253,15 +254,26 @@ def build_summary_prompt(
 
     intro = f"You are preparing meeting notes for {owner}." if owner else "You are preparing meeting notes."
 
+    if not language or language.lower() == "auto":
+        language_rule = (
+            "Write the notes in the SAME LANGUAGE as the transcript, detected "
+            "automatically (a Finnish transcript gets Finnish notes, an English one "
+            "English notes), and localize the section headings to that language."
+        )
+    else:
+        language_rule = f"Write the notes and section headings in {language}."
+
     return f"""
 {intro}
+
+{language_rule}
 
 Create concise Markdown meeting notes from this transcript.
 
 Rules:
 - Put ACTION ITEMS first.
 - Action items must be grouped by person when a responsible person can be inferred.{owner_rules}
-- If ownership is unclear, put it under "Unassigned".
+- If ownership is unclear, put it under an "Unassigned" heading (localized to the notes' language).
 - After action items, include Decisions, Key Points, Risks/Open Questions, and Short Summary.
 - Do not invent facts not supported by the transcript.
 
@@ -278,6 +290,7 @@ def summarize(
     owner: str = "",
     aliases: list[str] | None = None,
     max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
+    language: str = "auto",
 ) -> None:
     paths = output_paths(job_dir)
     write_progress(progress, stage="summarizing", progress=0.84, message="Creating summary and action items")
@@ -301,7 +314,7 @@ def summarize(
             file=sys.stderr,
         )
 
-    prompt = build_summary_prompt(text, owner=owner, aliases=aliases, max_chars=max_chars)
+    prompt = build_summary_prompt(text, owner=owner, aliases=aliases, max_chars=max_chars, language=language)
     summary = summarizer.summarize(prompt)
     if not summary.lstrip().startswith("#"):
         summary = "# Meeting Summary\n\n" + summary
@@ -318,6 +331,7 @@ def main() -> int:
     parser.add_argument("--diarize-model")
     parser.add_argument("--summary-model")
     parser.add_argument("--summary", choices=["on", "off"])
+    parser.add_argument("--summary-language", help='"auto" (match transcript) or a language name like "Finnish".')
     parser.add_argument("--chunk-seconds", type=int)
     parser.add_argument("--progress")
     args = parser.parse_args()
@@ -351,6 +365,7 @@ def main() -> int:
     if not isinstance(summary_aliases, list):
         summary_aliases = []
     summary_max_chars = int(config.get("summary_max_chars", DEFAULT_SUMMARY_MAX_CHARS))
+    summary_language = args.summary_language or config.get("summary_language") or "auto"
 
     write_progress(progress, stage="starting", progress=0.01, message="Starting transcription")
     duration = recording_duration_seconds(recording)
@@ -427,6 +442,7 @@ def main() -> int:
             owner=summary_owner,
             aliases=summary_aliases,
             max_chars=summary_max_chars,
+            language=summary_language,
         )
 
     manifest = {
