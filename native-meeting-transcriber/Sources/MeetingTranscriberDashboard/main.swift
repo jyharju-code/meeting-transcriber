@@ -251,8 +251,8 @@ final class DashboardModel: ObservableObject {
     @Published var microphoneLevel = 0.0
     @Published var currentOutput = ""
     @Published var transcriptFormat = "md"
-    @Published var transcribeModel = "gpt-4o-mini-transcribe"
-    @Published var summaryModel = "gpt-4o-mini"
+    @Published var transcribeModel = "gemini-3.5-transcribe"
+    @Published var summaryModel = "gemini-3.5-flash"
     @Published var summaryEnabled = true
     @Published var transcriptionProgress = 0.0
     @Published var transcriptionMessage = ""
@@ -267,18 +267,16 @@ final class DashboardModel: ObservableObject {
     private var autoOutputURL: URL?
     private var lastAutoCommandKey = ""
     private var timer: Timer?
+    // Google Gemini models (0 EUR on the AI Studio free tier). gemini-3.5-transcribe
+    // is the dedicated ASR model; gemini-3.5-flash is the robust general fallback.
     private let transcribeModels = [
-        "gpt-4o-mini-transcribe",
-        "gpt-4o-transcribe",
-        "gpt-4o-transcribe-diarize"
+        "gemini-3.5-transcribe",
+        "gemini-3.5-flash"
     ]
-    // Verified OpenAI chat models only. Edit this list to expose newer ones once
-    // you've confirmed they exist and work with the Responses API.
     private let summaryModels = [
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4.1-mini",
-        "gpt-4.1"
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite"
     ]
 
     init() {
@@ -435,12 +433,15 @@ final class DashboardModel: ObservableObject {
 
     func setTranscribeModel(_ value: String) {
         transcribeModel = value
-        updateConfig(key: "transcribe_model", value: value)
+        // Drive the Gemini provider and make sure it is the selected one.
+        updateConfig(key: "gemini_transcribe_model", value: value)
+        updateConfig(key: "transcribe_provider", value: "gemini")
     }
 
     func setSummaryModel(_ value: String) {
         summaryModel = value
-        updateConfig(key: "summary_model", value: value)
+        updateConfig(key: "gemini_summary_model", value: value)
+        updateConfig(key: "summary_provider", value: "gemini")
     }
 
     func setSummaryEnabled(_ value: Bool) {
@@ -516,8 +517,8 @@ final class DashboardModel: ObservableObject {
             return
         }
         transcriptFormat = (object["transcribe_output_format"] as? String) ?? "md"
-        transcribeModel = (object["transcribe_model"] as? String) ?? "gpt-4o-mini-transcribe"
-        summaryModel = (object["summary_model"] as? String) ?? "gpt-4o-mini"
+        transcribeModel = (object["gemini_transcribe_model"] as? String) ?? "gemini-3.5-transcribe"
+        summaryModel = (object["gemini_summary_model"] as? String) ?? "gemini-3.5-flash"
         summaryEnabled = ((object["summary"] as? String) ?? "on") != "off"
     }
 
