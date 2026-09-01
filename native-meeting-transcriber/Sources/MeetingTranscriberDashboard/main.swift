@@ -582,7 +582,13 @@ final class DashboardModel: ObservableObject {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
             guard let eq = trimmed.firstIndex(of: "=") else { continue }
-            let key = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces)
+            var key = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces)
+            // Tolerate a leading `export ` (shell-style env files use it; the
+            // watcher sources the file so it works there, but this parser must
+            // strip it or the variable name ends up as "export NAME").
+            if key.hasPrefix("export ") {
+                key = String(key.dropFirst("export ".count)).trimmingCharacters(in: .whitespaces)
+            }
             var value = String(trimmed[trimmed.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
             if value.count >= 2,
                (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
