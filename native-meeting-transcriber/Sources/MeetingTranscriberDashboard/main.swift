@@ -12,9 +12,12 @@ private let appRoot = runtimeRoot.appendingPathComponent("app")
 private let outputRoot = runtimeRoot.appendingPathComponent("output")
 private let statusURL = runtimeRoot.appendingPathComponent("status.json")
 private let commandURL = runtimeRoot.appendingPathComponent("dashboard-command.json")
+private let acknowledgementURL = runtimeRoot.appendingPathComponent("dashboard-ack.json")
+private let suppressionURL = runtimeRoot.appendingPathComponent("auto-suppression.json")
 private let configURL = appRoot.appendingPathComponent("config.json")
 private let envURL = home.appendingPathComponent(".meeting-transcriber.env")
 private let transcribePython = runtimeRoot.appendingPathComponent("venv/bin/python")
+let statusStaleSeconds: TimeInterval = 10
 
 struct RecorderStatus: Decodable {
     var recording: Bool
@@ -23,6 +26,45 @@ struct RecorderStatus: Decodable {
     var microphoneLevel: Double
     var outputPath: String
     var updatedAt: String
+}
+
+enum RecordingOrigin: Equatable {
+    case manual
+    case automatic(commandID: String)
+    case external
+}
+
+enum RecordingState: Equatable {
+    case idle
+    case starting(RecordingOrigin)
+    case recording(RecordingOrigin)
+    case stopping(RecordingOrigin)
+
+    var isRecording: Bool {
+        switch self {
+        case .idle:
+            return false
+        case .starting, .recording, .stopping:
+            return true
+        }
+    }
+}
+
+func statusIsFresh(_ status: RecorderStatus, now: Date = Date(), threshold: TimeInterval = statusStaleSeconds) -> Bool {
+    guard let updatedAt = ISO8601DateFormatter().date(from: status.updatedAt) else { return false }
+    return now.timeIntervalSince(updatedAt) <= threshold
+}
+
+func resolvedRecordingFlag(
+    hasManualRecorder: Bool,
+    hasAutoRecorder: Bool,
+    status: RecorderStatus?,
+    now: Date = Date(),
+    staleAfter: TimeInterval = statusStaleSeconds
+) -> Bool {
+    if hasManualRecorder || hasAutoRecorder { return true }
+    guard let status, statusIsFresh(status, now: now, threshold: staleAfter) else { return false }
+    return status.recording
 }
 
 struct RecordingItem: Identifiable {
@@ -52,6 +94,7 @@ final class DashboardStatusWriter {
 
     func update(system: Double? = nil, microphone: Double? = nil, recording: Bool = true) {
         lock.lock()
+        defer { lock.unlock() }
         if let system { systemLevel = min(1, max(0, systemLevel * 0.7 + system * 0.3)) }
         if let microphone { microphoneLevel = min(1, max(0, microphoneLevel * 0.7 + microphone * 0.3)) }
         let payload: [String: Any] = [
@@ -62,8 +105,6 @@ final class DashboardStatusWriter {
             "outputPath": recording ? outputPath : "",
             "updatedAt": ISO8601DateFormatter().string(from: Date())
         ]
-        lock.unlock()
-
         do {
             try FileManager.default.createDirectory(at: statusURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
@@ -80,10 +121,14 @@ final class DashboardRecorder: NSObject, @unchecked Sendable, SCRecordingOutputD
     private let statusWriter = DashboardStatusWriter()
     private var onFinish: (@Sendable (Int32, String?) -> Void)?
     private var stopping = false
+    private let finishLock = NSLock()
+    private var finished = false
+    private var heartbeat: DispatchSourceTimer?
 
     func start(outputURL: URL, onFinish: @escaping @Sendable (Int32, String?) -> Void) async throws {
         self.onFinish = onFinish
         stopping = false
+        finished = false
         statusWriter.setOutput(outputURL.path)
 
         if !CGPreflightScreenCaptureAccess() {
@@ -146,6 +191,10 @@ final class DashboardRecorder: NSObject, @unchecked Sendable, SCRecordingOutputD
         self.recordingOutput = recordingOutput
         try await stream.startCapture()
         statusWriter.update(recording: true)
+        startHeartbeat()
+        if stopping {
+            stop()
+        }
     }
 
     func stop() {
@@ -155,6 +204,15 @@ final class DashboardRecorder: NSObject, @unchecked Sendable, SCRecordingOutputD
                 self?.finish(status: 1, error: error.localizedDescription)
             }
         }
+    }
+
+    func cancelFailedStart() {
+        heartbeat?.cancel()
+        heartbeat = nil
+        statusWriter.update(recording: false)
+        stream = nil
+        recordingOutput = nil
+        onFinish = nil
     }
 
     func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
@@ -185,12 +243,31 @@ final class DashboardRecorder: NSObject, @unchecked Sendable, SCRecordingOutputD
     }
 
     private func finish(status: Int32, error: String?) {
+        finishLock.lock()
+        guard !finished else {
+            finishLock.unlock()
+            return
+        }
+        finished = true
+        finishLock.unlock()
+        heartbeat?.cancel()
+        heartbeat = nil
         statusWriter.update(recording: false)
         stream = nil
         recordingOutput = nil
         let callback = onFinish
         onFinish = nil
         callback?(status, error)
+    }
+
+    private func startHeartbeat() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "dashboard.status-heartbeat"))
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            self?.statusWriter.update(recording: true)
+        }
+        heartbeat = timer
+        timer.resume()
     }
 
     private func rmsLevel(_ sampleBuffer: CMSampleBuffer) -> Double? {
@@ -245,7 +322,7 @@ final class DashboardRecorder: NSObject, @unchecked Sendable, SCRecordingOutputD
 
 @MainActor
 final class DashboardModel: ObservableObject {
-    @Published var isRecording = false
+    @Published private(set) var recordingState: RecordingState = .idle
     @Published var level = 0.0
     @Published var systemLevel = 0.0
     @Published var microphoneLevel = 0.0
@@ -258,13 +335,13 @@ final class DashboardModel: ObservableObject {
     @Published var transcriptionMessage = ""
     @Published var files: [RecordingItem] = []
     @Published var message = "Ready"
-    @Published var manualRecordingActive = false
+    @Published private(set) var autoSuppressed = false
     @Published var hudVisible = UserDefaults.standard.object(forKey: "hudVisible") as? Bool ?? true
 
     private var manualRecorder: DashboardRecorder?
-    private var manualOutputURL: URL?
     private var autoRecorder: DashboardRecorder?
-    private var autoOutputURL: URL?
+    private var activeAutoCommandID: String?
+    private var activeAutoOutputURL: URL?
     private var lastAutoCommandKey = ""
     private var timer: Timer?
     // Google Gemini models (0 EUR on the AI Studio free tier). gemini-3.5-transcribe
@@ -279,6 +356,42 @@ final class DashboardModel: ObservableObject {
         "gemini-3.5-flash-lite"
     ]
 
+    var isRecording: Bool { recordingState.isRecording }
+
+    var canStopRecording: Bool {
+        guard manualRecorder != nil || autoRecorder != nil else { return false }
+        switch recordingState {
+        case .recording(.manual), .recording(.automatic):
+            return true
+        case .idle, .starting, .stopping, .recording(.external):
+            return false
+        }
+    }
+
+    var primaryActionTitle: String {
+        switch recordingState {
+        case .idle:
+            return "Start"
+        case .starting:
+            return "Starting"
+        case .recording:
+            return "Stop"
+        case .stopping:
+            return "Stopping"
+        }
+    }
+
+    var primaryActionDisabled: Bool {
+        switch recordingState {
+        case .starting, .stopping:
+            return true
+        case .recording(.external):
+            return true
+        case .idle, .recording:
+            return false
+        }
+    }
+
     init() {
         loadConfig()
         refresh()
@@ -291,12 +404,13 @@ final class DashboardModel: ObservableObject {
     }
 
     func refresh() {
+        autoSuppressed = FileManager.default.fileExists(atPath: suppressionURL.path)
         readStatus()
         readFiles()
     }
 
     func startManualRecording() {
-        guard manualRecorder == nil else { return }
+        guard manualRecorder == nil && autoRecorder == nil else { return }
         do {
             try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
             let formatter = DateFormatter()
@@ -307,16 +421,18 @@ final class DashboardModel: ObservableObject {
 
             let recorder = DashboardRecorder()
             manualRecorder = recorder
-            manualOutputURL = outputURL
-            manualRecordingActive = true
+            recordingState = .starting(.manual)
+            currentOutput = outputURL.path
+            level = 0
+            systemLevel = 0
+            microphoneLevel = 0
             message = "Manual recording starting"
-            Task {
+            Task { [weak self] in
                 do {
                     try await recorder.start(outputURL: outputURL) { [weak self] status, error in
                         Task { @MainActor in
                             self?.manualRecorder = nil
-                            self?.manualRecordingActive = false
-                            self?.isRecording = false
+                            self?.recordingState = .idle
                             self?.refresh()
                             if status == 0 {
                                 self?.message = "Manual recording saved"
@@ -327,15 +443,16 @@ final class DashboardModel: ObservableObject {
                         }
                     }
                     await MainActor.run {
-                        self.isRecording = true
-                        self.message = "Manual recording started"
+                        guard self?.recordingState == .starting(.manual) else { return }
+                        self?.recordingState = .recording(.manual)
+                        self?.message = "Manual recording started"
                     }
                 } catch {
                     await MainActor.run {
-                        self.manualRecorder = nil
-                        self.manualRecordingActive = false
-                        self.isRecording = false
-                        self.message = error.localizedDescription
+                        recorder.cancelFailedStart()
+                        self?.manualRecorder = nil
+                        self?.recordingState = .idle
+                        self?.message = error.localizedDescription
                     }
                 }
             }
@@ -344,11 +461,37 @@ final class DashboardModel: ObservableObject {
         }
     }
 
-    func stopManualRecording() {
-        guard let manualRecorder else { return }
-        manualRecorder.stop()
-        manualRecordingActive = false
-        message = "Stopping manual recording"
+    func stopRecording(userInitiated: Bool = true) {
+        if let manualRecorder {
+            recordingState = .stopping(.manual)
+            message = "Stopping manual recording"
+            manualRecorder.stop()
+            return
+        }
+
+        guard let autoRecorder, let commandID = activeAutoCommandID else { return }
+        if userInitiated {
+            guard writeSuppression(commandID: commandID) else {
+                message = "Could not suppress automatic restart; recording was not stopped"
+                return
+            }
+        }
+        writeAcknowledgement(commandID: commandID, state: "stopping", outputURL: activeAutoOutputURL)
+        recordingState = .stopping(.automatic(commandID: commandID))
+        message = "Stopping automatic recording"
+        autoRecorder.stop()
+    }
+
+    func resumeAutomaticRecording() {
+        do {
+            try FileManager.default.removeItem(at: suppressionURL)
+        } catch CocoaError.fileNoSuchFile {
+        } catch {
+            message = "Could not resume automatic recording: \(error.localizedDescription)"
+            return
+        }
+        autoSuppressed = false
+        message = "Automatic recording resumed"
     }
 
     private func handleAutoCommand() {
@@ -371,51 +514,127 @@ final class DashboardModel: ObservableObject {
                 message = "Automatic recording command was missing output path"
                 return
             }
-            startAutoRecording(outputURL: URL(fileURLWithPath: outputPath), detail: object["detail"] as? String)
+            startAutoRecording(
+                outputURL: URL(fileURLWithPath: outputPath),
+                detail: object["detail"] as? String,
+                commandID: id
+            )
         } else if command == "stop" {
-            stopAutoRecording()
+            guard activeAutoCommandID == id else { return }
+            stopRecording(userInitiated: false)
         }
     }
 
-    private func startAutoRecording(outputURL: URL, detail: String?) {
+    private func startAutoRecording(outputURL: URL, detail: String?, commandID: String) {
         let recorder = DashboardRecorder()
         autoRecorder = recorder
-        autoOutputURL = outputURL
+        activeAutoCommandID = commandID
+        activeAutoOutputURL = outputURL
+        recordingState = .starting(.automatic(commandID: commandID))
+        currentOutput = outputURL.path
+        level = 0
+        systemLevel = 0
+        microphoneLevel = 0
+        guard writeAcknowledgement(commandID: commandID, state: "starting", outputURL: outputURL) else {
+            autoRecorder = nil
+            activeAutoCommandID = nil
+            activeAutoOutputURL = nil
+            recordingState = .idle
+            currentOutput = ""
+            return
+        }
         message = detail == nil ? "Automatic recording starting" : "Automatic recording starting: \(detail!)"
-        Task {
+        Task { [weak self] in
             do {
                 try await recorder.start(outputURL: outputURL) { [weak self] status, error in
                     Task { @MainActor in
                         self?.autoRecorder = nil
-                        self?.isRecording = false
+                        self?.activeAutoCommandID = nil
+                        self?.activeAutoOutputURL = nil
+                        self?.recordingState = .idle
+                        let acknowledged = self?.writeAcknowledgement(
+                            commandID: commandID,
+                            state: status == 0 ? "stopped" : "failed",
+                            outputURL: outputURL,
+                            error: error
+                        ) ?? false
                         self?.refresh()
                         if status == 0 {
-                            self?.message = "Automatic recording saved"
+                            self?.message = acknowledged
+                                ? "Automatic recording saved"
+                                : "Automatic recording saved; watcher acknowledgement failed"
                             self?.transcribe(url: outputURL)
                         } else {
-                            self?.message = error ?? "Automatic recording failed"
+                            let failure = error ?? "Automatic recording failed"
+                            self?.message = acknowledged ? failure : "\(failure); watcher acknowledgement failed"
                         }
                     }
                 }
                 await MainActor.run {
-                    self.isRecording = true
-                    self.currentOutput = outputURL.path
-                    self.message = "Automatic recording started"
+                    guard self?.recordingState == .starting(.automatic(commandID: commandID)) else { return }
+                    self?.recordingState = .recording(.automatic(commandID: commandID))
+                    self?.currentOutput = outputURL.path
+                    self?.message = "Automatic recording started"
+                    self?.writeAcknowledgement(commandID: commandID, state: "recording", outputURL: outputURL)
                 }
             } catch {
                 await MainActor.run {
-                    self.autoRecorder = nil
-                    self.isRecording = false
-                    self.message = error.localizedDescription
+                    recorder.cancelFailedStart()
+                    self?.autoRecorder = nil
+                    self?.activeAutoCommandID = nil
+                    self?.activeAutoOutputURL = nil
+                    self?.recordingState = .idle
+                    self?.message = error.localizedDescription
+                    self?.writeAcknowledgement(
+                        commandID: commandID,
+                        state: "failed",
+                        outputURL: outputURL,
+                        error: error.localizedDescription
+                    )
                 }
             }
         }
     }
 
-    private func stopAutoRecording() {
-        guard let autoRecorder else { return }
-        autoRecorder.stop()
-        message = "Stopping automatic recording"
+    @discardableResult
+    private func writeSuppression(commandID: String) -> Bool {
+        let payload: [String: Any] = [
+            "suppressed": true,
+            "commandID": commandID,
+            "createdAt": ISO8601DateFormatter().string(from: Date()),
+            "reason": "user_stop"
+        ]
+        do {
+            try writeJSON(payload, to: suppressionURL)
+            autoSuppressed = true
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    private func writeAcknowledgement(commandID: String, state: String, outputURL: URL?, error: String? = nil) -> Bool {
+        var payload: [String: Any] = [
+            "commandID": commandID,
+            "state": state,
+            "outputPath": outputURL?.path ?? "",
+            "updatedAt": ISO8601DateFormatter().string(from: Date())
+        ]
+        if let error { payload["error"] = error }
+        do {
+            try writeJSON(payload, to: acknowledgementURL)
+            return true
+        } catch {
+            message = "Dashboard acknowledgement failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func writeJSON(_ object: [String: Any], to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
     }
 
     func openOutputFolder() {
@@ -456,23 +675,44 @@ final class DashboardModel: ObservableObject {
     }
 
     private func readStatus() {
-        guard let data = try? Data(contentsOf: statusURL),
-              let status = try? JSONDecoder().decode(RecorderStatus.self, from: data) else {
-            if manualRecorder == nil {
-                isRecording = false
-                level = 0
-                systemLevel = 0
-                microphoneLevel = 0
+        let status: RecorderStatus?
+        if let data = try? Data(contentsOf: statusURL) {
+            status = try? JSONDecoder().decode(RecorderStatus.self, from: data)
+        } else {
+            status = nil
+        }
+        let hasLocalRecorder = manualRecorder != nil || autoRecorder != nil
+
+        if hasLocalRecorder {
+            if let status, statusIsFresh(status) {
+                updateMeters(from: status)
+                if !status.outputPath.isEmpty {
+                    currentOutput = status.outputPath
+                }
+                readProgress(activeOutput: status.outputPath)
             }
             return
         }
 
-        isRecording = status.recording
+        guard let status, statusIsFresh(status) else {
+            recordingState = .idle
+            level = 0
+            systemLevel = 0
+            microphoneLevel = 0
+            currentOutput = ""
+            return
+        }
+
+        recordingState = status.recording ? .recording(.external) : .idle
+        updateMeters(from: status)
+        currentOutput = status.recording ? status.outputPath : ""
+        readProgress(activeOutput: status.outputPath)
+    }
+
+    private func updateMeters(from status: RecorderStatus) {
         level = min(max(status.level, 0), 1)
         systemLevel = min(max(status.systemLevel, 0), 1)
         microphoneLevel = min(max(status.microphoneLevel, 0), 1)
-        currentOutput = status.recording ? status.outputPath : ""
-        readProgress(activeOutput: status.outputPath)
     }
 
     private func readFiles() {
@@ -650,10 +890,10 @@ struct DashboardView: View {
                 Text(model.isRecording ? "Recording" : "Idle")
                     .font(.headline)
                 Spacer()
-                Button(model.isRecording ? "Stop" : "Start") {
-                    model.manualRecordingActive ? model.stopManualRecording() : model.startManualRecording()
+                Button(model.primaryActionTitle) {
+                    model.isRecording ? model.stopRecording() : model.startManualRecording()
                 }
-                .disabled(model.isRecording && !model.manualRecordingActive)
+                .disabled(model.primaryActionDisabled)
                 .keyboardShortcut(.defaultAction)
                 Button("Folder") {
                     model.openOutputFolder()
@@ -697,6 +937,11 @@ struct DashboardView: View {
                     get: { model.hudVisible },
                     set: { model.setHUDVisible($0) }
                 ))
+                if model.autoSuppressed {
+                    Button("Resume automatic recording") {
+                        model.resumeAutomaticRecording()
+                    }
+                }
                 HStack {
                     Text("Transcribe")
                         .frame(width: 72, alignment: .leading)
@@ -785,6 +1030,16 @@ struct HUDView: View {
                 .frame(width: 34, alignment: .leading)
             LevelBar(value: model.level, color: model.isRecording ? .red : .gray)
                 .frame(width: 76)
+            if model.canStopRecording {
+                Button {
+                    model.stopRecording()
+                } label: {
+                    Image(systemName: "stop.fill")
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Stop recording")
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -811,7 +1066,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func createHUD() {
         let view = HUDView(model: model)
         let window = NSWindow(
-            contentRect: NSRect(x: 40, y: 40, width: 150, height: 38),
+            contentRect: NSRect(x: 40, y: 40, width: 180, height: 38),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false

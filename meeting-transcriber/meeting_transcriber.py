@@ -31,6 +31,12 @@ TAB_DELIMITER = "|||MT_TAB|||"
 MEET_RE = re.compile(r"https?://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}", re.I)
 TEAMS_URL_RE = re.compile(r"https?://(?:teams\.microsoft|teams\.live)\.com/", re.I)
 TEAMS_WINDOW_RE = re.compile(r"\b(meeting|call|teams meeting)\b", re.I)
+DEFAULT_TEAMS_IGNORED_TITLES = [
+    "liity keskusteluun",
+    "join the conversation",
+    "join now",
+    "pre-join",
+]
 
 
 @dataclass
@@ -58,6 +64,20 @@ class DashboardCommandProcess:
             self.command_id,
             self.audio_path,
         )
+
+
+@dataclass
+class ActiveRecording:
+    recorder: subprocess.Popen[str] | DashboardCommandProcess | None = None
+    audio_path: Path | None = None
+    started_at: float | None = None
+    detection: Detection | None = None
+
+    def clear(self) -> None:
+        self.recorder = None
+        self.audio_path = None
+        self.started_at = None
+        self.detection = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -173,7 +193,11 @@ def detect_meeting(config: dict[str, Any]) -> Detection | None:
         for url, title in browser_tabs(app_name):
             if MEET_RE.search(url):
                 return Detection("Google Meet", app_name, title or url)
-            if TEAMS_URL_RE.search(url) and ("meet" in url.lower() or "call" in title.lower()):
+            if (
+                TEAMS_URL_RE.search(url)
+                and ("meet" in url.lower() or "call" in title.lower())
+                and not teams_title_is_ignored(title, config)
+            ):
                 return Detection("Microsoft Teams", app_name, title or url)
 
     for title in teams_window_titles():
@@ -181,6 +205,14 @@ def detect_meeting(config: dict[str, Any]) -> Detection | None:
             return Detection("Microsoft Teams", "Teams app", title)
 
     return None
+
+
+def teams_title_is_ignored(title: str, config: dict[str, Any]) -> bool:
+    ignored = config.get("teams_ignored_titles", DEFAULT_TEAMS_IGNORED_TITLES)
+    if not isinstance(ignored, list):
+        ignored = DEFAULT_TEAMS_IGNORED_TITLES
+    normalized = title.casefold().strip()
+    return any(str(value).casefold().strip() in normalized for value in ignored if str(value).strip())
 
 
 def timestamp_slug() -> str:
@@ -241,6 +273,77 @@ def sweep_orphan_job_folders(config: dict[str, Any]) -> None:
 
 def default_dashboard_command_file() -> Path:
     return Path("~/.meeting-transcriber/dashboard-command.json").expanduser()
+
+
+def control_file(config: dict[str, Any], key: str, default: str) -> Path:
+    return Path(config.get(key, default)).expanduser()
+
+
+def read_json_object(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else None
+
+
+def read_auto_suppression(config: dict[str, Any]) -> dict[str, Any] | None:
+    path = control_file(
+        config,
+        "auto_suppression_file",
+        "~/.meeting-transcriber/auto-suppression.json",
+    )
+    if not path.exists():
+        return None
+    try:
+        payload = read_json_object(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        log(config, f"Automatic recording remains suppressed; invalid suppression file: {exc}")
+        return {"suppressed": True, "malformed": True}
+    if payload is None:
+        log(config, "Automatic recording remains suppressed; suppression file is not a JSON object")
+        return {"suppressed": True, "malformed": True}
+    return payload if payload.get("suppressed") is True else None
+
+
+def clear_auto_suppression(config: dict[str, Any]) -> None:
+    path = control_file(
+        config,
+        "auto_suppression_file",
+        "~/.meeting-transcriber/auto-suppression.json",
+    )
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log(config, f"Could not clear automatic recording suppression: {exc}")
+        return
+    log(config, "Automatic recording suppression cleared after meeting detection ended")
+
+
+def read_dashboard_ack(config: dict[str, Any]) -> dict[str, Any] | None:
+    path = control_file(
+        config,
+        "dashboard_ack_file",
+        "~/.meeting-transcriber/dashboard-ack.json",
+    )
+    try:
+        return read_json_object(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        log(config, f"Ignoring invalid dashboard acknowledgement: {exc}")
+        return None
+
+
+def acknowledgement_finishes_session(
+    session: ActiveRecording,
+    acknowledgement: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(session.recorder, DashboardCommandProcess) or not acknowledgement:
+        return False
+    if acknowledgement.get("commandID") != session.recorder.command_id:
+        return False
+    if acknowledgement.get("state") not in {"stopped", "failed"}:
+        return False
+    session.clear()
+    return True
 
 
 def ensure_dashboard_running(config: dict[str, Any]) -> None:
@@ -427,10 +530,8 @@ def watch(config_path: Path, once: bool = False) -> int:
 
     hits = 0
     misses = 0
-    recorder: subprocess.Popen[str] | DashboardCommandProcess | None = None
-    audio_path: Path | None = None
-    started_at: float | None = None
-    active_detection: Detection | None = None
+    session = ActiveRecording()
+    suppression_misses = 0
 
     log(config, "Meeting transcriber watcher started")
     sweep_orphan_job_folders(config)
@@ -449,30 +550,48 @@ def watch(config_path: Path, once: bool = False) -> int:
             log(config, f"Detection: {detection}" if detection else "Detection: none")
             return 0
 
-        if detection:
-            hits += 1
-            misses = 0
-        else:
-            misses += 1
+        suppression = read_auto_suppression(config)
+        acknowledgement = read_dashboard_ack(config)
+        if acknowledgement_finishes_session(session, acknowledgement):
+            log(config, "Dashboard confirmed that the automatic recording ended")
             hits = 0
+            misses = 0
 
-        if recorder is None and detection and hits >= start_after_hits:
-            active_detection = detection
-            recorder, audio_path = start_recording(config, detection)
-            started_at = time.time() if recorder else None
+        if suppression:
+            hits = 0
+            misses = 0
+            if detection:
+                suppression_misses = 0
+            else:
+                suppression_misses += 1
+                if suppression_misses >= stop_after_misses:
+                    clear_auto_suppression(config)
+                    suppression = None
+                    suppression_misses = 0
+        else:
+            suppression_misses = 0
+            if detection:
+                hits += 1
+                misses = 0
+            else:
+                misses += 1
+                hits = 0
 
-        if recorder is not None:
-            too_long = started_at is not None and (time.time() - started_at) > max_minutes * 60
-            if misses >= stop_after_misses or too_long or recorder.poll() is not None:
+        if session.recorder is None and detection and hits >= start_after_hits and not suppression:
+            session.detection = detection
+            session.recorder, session.audio_path = start_recording(config, detection)
+            session.started_at = time.time() if session.recorder else None
+
+        if session.recorder is not None:
+            too_long = session.started_at is not None and (time.time() - session.started_at) > max_minutes * 60
+            if misses >= stop_after_misses or too_long or session.recorder.poll() is not None:
+                recorder = session.recorder
+                finished_audio = session.audio_path
                 dashboard_recording = isinstance(recorder, DashboardCommandProcess)
                 if not dashboard_recording and recorder.poll() is not None:
-                    log_recorder_failure(config, recorder, audio_path)
+                    log_recorder_failure(config, recorder, finished_audio)
                 stop_recording(config, recorder, stop_grace)
-                finished_audio = audio_path
-                recorder = None
-                audio_path = None
-                started_at = None
-                active_detection = None
+                session.clear()
                 hits = 0
                 misses = 0
                 if finished_audio and not dashboard_recording:

@@ -147,7 +147,11 @@ Start a Google Meet or Teams meeting. After two watcher detections, the watcher
 writes `~/.meeting-transcriber/dashboard-command.json`; the dashboard app performs
 the actual recording because it owns the macOS Screen/System Audio permission.
 
-Close the meeting tab/window to stop automatic recording.
+Use **Stop** in the dashboard or the stop-square button in the floating HUD to
+stop an automatic recording immediately. This creates a persistent suppression
+latch, so an old meeting tab cannot restart recording. Close the meeting tab and
+the latch clears after the configured miss count, or click **Resume automatic
+recording** in the dashboard to clear it yourself.
 
 ## Why Dashboard Command Mode Exists
 

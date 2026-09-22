@@ -187,6 +187,23 @@ class GeminiTests(unittest.TestCase):
         self.assertEqual(t.fallback_model, "")
         self.assertEqual(providers.build_summarizers(config)["gemini"].model, "gemini-3.5-flash")
 
+    def test_dashboard_model_overrides_explicit_gemini_block(self):
+        config = {
+            "gemini_transcribe_model": "gemini-ui-transcribe",
+            "gemini_transcribe_fallback_model": "gemini-ui-fallback",
+            "gemini_summary_model": "gemini-ui-summary",
+            "providers": {
+                "gemini": {
+                    "transcribe": {"type": "gemini", "model": "gemini-config-transcribe"},
+                    "summarize": {"type": "gemini", "model": "gemini-config-summary"},
+                }
+            },
+        }
+        transcriber = providers.build_transcribers(config)["gemini"]
+        self.assertEqual(transcriber.model, "gemini-ui-transcribe")
+        self.assertEqual(transcriber.fallback_model, "gemini-ui-fallback")
+        self.assertEqual(providers.build_summarizers(config)["gemini"].model, "gemini-ui-summary")
+
 
 class SummaryLanguageTests(unittest.TestCase):
     def test_auto_language_directive(self):

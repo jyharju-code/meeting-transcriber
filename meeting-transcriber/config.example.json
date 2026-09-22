@@ -14,7 +14,10 @@
   ],
   "recording_backend": "dashboard_command",
   "dashboard_command_file": "~/.meeting-transcriber/dashboard-command.json",
+  "dashboard_ack_file": "~/.meeting-transcriber/dashboard-ack.json",
+  "auto_suppression_file": "~/.meeting-transcriber/auto-suppression.json",
   "dashboard_app_path": "/Applications/Meeting Transcriber Dashboard.app",
+  "teams_ignored_titles": ["liity keskusteluun", "join the conversation", "join now", "pre-join"],
   "record_command": [
     "/Applications/Native Meeting Recorder.app/Contents/MacOS/native-meeting-recorder",
     "--output",

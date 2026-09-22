@@ -3,7 +3,8 @@
 Swift package for the native macOS pieces:
 
 - `meeting-transcriber-dashboard`: visible dashboard, manual recording, floating HUD,
-  format/model controls, and the dashboard-command recorder used by automatic mode.
+  Stop controls, format/model controls, and the dashboard-command recorder used by
+  automatic mode.
 - `native-meeting-recorder`: older helper recorder kept for direct CLI/manual testing.
 
 The dashboard uses Apple's `ScreenCaptureKit` to record system audio and microphone
@@ -50,6 +51,13 @@ Python watcher detects Meet/Teams
 
 This is why automatic recording depends on the dashboard app being installed and
 available. The watcher tries to reopen it from `/Applications` if it is not open.
+
+The dashboard writes recording lifecycle acknowledgements to
+`~/.meeting-transcriber/dashboard-ack.json`. Stopping an automatic recording from
+the dashboard or HUD first writes `~/.meeting-transcriber/auto-suppression.json`,
+which prevents a stale meeting page from starting another recording. Suppression
+clears after meeting detection disappears, or through **Resume automatic
+recording** in the dashboard.
 
 ## Direct CLI Recorder Smoke Test
 

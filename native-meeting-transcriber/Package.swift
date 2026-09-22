@@ -33,6 +33,11 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("SwiftUI")
             ]
+        ),
+        .testTarget(
+            name: "MeetingTranscriberDashboardTests",
+            dependencies: ["MeetingTranscriberDashboard"],
+            path: "Tests/MeetingTranscriberDashboardTests"
         )
     ]
 )

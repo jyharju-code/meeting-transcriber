@@ -583,10 +583,15 @@ def build_transcribers(config: dict[str, Any]) -> dict[str, Transcriber]:
                 max_parallel=max_parallel,
             )
         elif kind == "gemini":
+            model = block.get("model", GEMINI_TRANSCRIBE_MODEL)
+            fallback_model = block.get("fallback_model", GEMINI_FALLBACK_MODEL)
+            if name == "gemini":
+                model = config.get("gemini_transcribe_model", model)
+                fallback_model = config.get("gemini_transcribe_fallback_model", fallback_model)
             out[name] = GeminiTranscriber(
                 name=name,
-                model=block.get("model", GEMINI_TRANSCRIBE_MODEL),
-                fallback_model=block.get("fallback_model", GEMINI_FALLBACK_MODEL),
+                model=model,
+                fallback_model=fallback_model,
                 mode=block.get("mode", "smart"),
                 language_codes=block.get("language_codes", ["fi-FI"]),
                 key_env=spec.get("key_env"),
@@ -611,9 +616,12 @@ def build_summarizers(config: dict[str, Any]) -> dict[str, Summarizer]:
                 extra_headers=spec.get("extra_headers"),
             )
         elif block.get("type") == "gemini":
+            model = block.get("model", GEMINI_FALLBACK_MODEL)
+            if name == "gemini":
+                model = config.get("gemini_summary_model", model)
             out[name] = GeminiSummarizer(
                 name=name,
-                model=block.get("model", GEMINI_FALLBACK_MODEL),
+                model=model,
                 key_env=spec.get("key_env"),
             )
     return out

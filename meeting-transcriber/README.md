@@ -38,10 +38,9 @@ tried in order, then any other available provider, ending at the local floor. Ke
 live in `~/.meeting-transcriber.env` (one `NAME=value` per line), never in
 `config.json`.
 
-> **v1 note:** provider selection is via `config.json`. The dashboard's model
-> pickers still write the legacy top-level `transcribe_model`/`summary_model` keys,
-> which apply only when no `providers` block is present. A dashboard provider
-> picker is a follow-up.
+The dashboard's Gemini model pickers write top-level model overrides. Provider
+construction applies those overrides to the explicit `providers.gemini` registry,
+so the selected dashboard model is the model used by the worker.
 
 ## Install
 
@@ -84,7 +83,10 @@ defaults shown when omitted. `~` is expanded in path values.
 | `browser_apps` | Chrome, Edge, Brave, Arc, Safari | Browsers scanned for meeting tabs. |
 | `recording_backend` | `dashboard_command` | `dashboard_command` (recommended) or empty to use `record_command`. |
 | `dashboard_command_file` | `~/.meeting-transcriber/dashboard-command.json` | Command hand-off file the dashboard watches. |
+| `dashboard_ack_file` | `~/.meeting-transcriber/dashboard-ack.json` | Dashboard acknowledgement read by the watcher. |
+| `auto_suppression_file` | `~/.meeting-transcriber/auto-suppression.json` | Persistent latch created when the user stops an automatic recording. |
 | `dashboard_app_path` | `/Applications/Meeting Transcriber Dashboard.app` | Dashboard app the watcher reopens if needed. |
+| `teams_ignored_titles` | known prejoin titles | Teams page titles that must not trigger recording. |
 | `record_command` | — | Argv for the direct backend; `{output}`/`{status}` are substituted. |
 | `status_file` | `~/.meeting-transcriber/status.json` | Live recorder status (level meters, etc.). |
 | `transcribe_after_recording` | `true` | Run the worker automatically when a recording finishes. |
