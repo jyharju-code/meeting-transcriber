@@ -37,6 +37,30 @@ DEFAULT_TEAMS_IGNORED_TITLES = [
     "join now",
     "pre-join",
 ]
+# Teams (new client) only puts the word "Meeting" in a window title for the
+# pre-join screen ("Meeting join | <subject> | ...") and the pop-out compact view
+# ("Meeting compact view | <subject> | ..."). The full meeting window is titled
+# just "<subject> | ... | Microsoft Teams", so a title regex alone loses the
+# meeting whenever the user focuses Teams. We therefore learn the meeting subject
+# and keep matching any Teams window that carries it.
+TEAMS_MEETING_PREFIX_RE = re.compile(
+    r"^(meeting(\s+(compact view|join|window|stage))?|call|kokous(\s+\S+)*|puhelu)$", re.I
+)
+TEAMS_TITLE_NOISE_RE = re.compile(
+    r"^(microsoft teams|personal|work or school|anonymous|henkilökohtainen|työ tai koulu|\S+@\S+\.\S+)$",
+    re.I,
+)
+TEAMS_NAV_SECTIONS = {
+    "chat", "activity", "calendar", "teams", "files", "calls", "apps", "communities",
+    "onedrive", "copilot", "planner", "settings", "people",
+    "keskustelu", "keskustelut", "toiminta", "kalenteri", "tiedostot", "puhelut",
+    "sovellukset", "yhteisöt", "asetukset", "henkilöt",
+}
+TEAMS_GENERIC_SUBJECTS = {
+    "microsoft teams meeting", "teams meeting", "meeting", "kokous",
+    "microsoft teams -kokous", "teams-kokous",
+}
+STICKY_SOURCE = "Teams app (meeting window)"
 
 
 @dataclass
@@ -44,6 +68,42 @@ class Detection:
     provider: str
     source: str
     detail: str
+    subject: str = ""
+
+
+def teams_title_segments(title: str) -> list[str]:
+    return [part.strip() for part in title.split("|") if part.strip()]
+
+
+def teams_meeting_subject(title: str) -> str:
+    """Extract the meeting subject from a Teams window title, or "" if unknown."""
+    segments = teams_title_segments(title)
+    if segments and TEAMS_MEETING_PREFIX_RE.match(segments[0]):
+        segments = segments[1:]
+    segments = [s for s in segments if not TEAMS_TITLE_NOISE_RE.match(s)]
+    if not segments:
+        return ""
+    subject = segments[0]
+    if len(subject) < 4 or subject.casefold() in TEAMS_GENERIC_SUBJECTS:
+        return ""
+    if subject.casefold() in TEAMS_NAV_SECTIONS:
+        return ""
+    return subject
+
+
+def teams_title_is_nav(title: str) -> bool:
+    """True for Teams navigation windows (Chat | ..., Calendar | ...), never a call."""
+    segments = teams_title_segments(title)
+    return bool(segments) and segments[0].casefold() in TEAMS_NAV_SECTIONS
+
+
+def sticky_teams_detection(titles: list[str], subjects: list[str]) -> Detection | None:
+    for subject in subjects:
+        needle = subject.casefold()
+        for title in titles:
+            if needle in title.casefold() and not teams_title_is_nav(title):
+                return Detection("Microsoft Teams", STICKY_SOURCE, title, subject)
+    return None
 
 
 class DashboardCommandProcess:
@@ -183,7 +243,7 @@ return output
     return titles
 
 
-def detect_meeting(config: dict[str, Any]) -> Detection | None:
+def detect_meeting(config: dict[str, Any], sticky_subjects: list[str] | None = None) -> Detection | None:
     browsers = config.get(
         "browser_apps",
         ["Google Chrome", "Microsoft Edge", "Brave Browser", "Arc", "Safari"],
@@ -198,11 +258,17 @@ def detect_meeting(config: dict[str, Any]) -> Detection | None:
                 and ("meet" in url.lower() or "call" in title.lower())
                 and not teams_title_is_ignored(title, config)
             ):
-                return Detection("Microsoft Teams", app_name, title or url)
+                return Detection("Microsoft Teams", app_name, title or url, teams_meeting_subject(title))
 
-    for title in teams_window_titles():
+    titles = teams_window_titles()
+    for title in titles:
         if TEAMS_WINDOW_RE.search(title):
-            return Detection("Microsoft Teams", "Teams app", title)
+            return Detection("Microsoft Teams", "Teams app", title, teams_meeting_subject(title))
+
+    # The meeting window itself has no "Meeting" in its title; recognise it by the
+    # subject learned from the join screen / compact view.
+    if sticky_subjects:
+        return sticky_teams_detection(titles, sticky_subjects)
 
     return None
 
@@ -386,6 +452,27 @@ def write_dashboard_command(
     log(config, f"Dashboard command written: {command} {command_id}")
 
 
+def write_meeting_meta(job_dir: Path, detection: Detection) -> None:
+    """Record what was detected so fragments of one meeting can be regrouped."""
+    try:
+        (job_dir / "meeting.json").write_text(
+            json.dumps(
+                {
+                    "provider": detection.provider,
+                    "source": detection.source,
+                    "detail": detection.detail,
+                    "subject": detection.subject,
+                    "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def start_recording(config: dict[str, Any], detection: Detection) -> tuple[subprocess.Popen[str] | DashboardCommandProcess | None, Path | None]:
     backend = str(config.get("recording_backend", "")).strip().lower()
     if backend == "dashboard_command":
@@ -395,6 +482,7 @@ def start_recording(config: dict[str, Any], detection: Detection) -> tuple[subpr
         job_dir = output_dir / f"{timestamp_slug()}-{provider_slug}"
         job_dir.mkdir(parents=True, exist_ok=True)
         audio_path = job_dir / "recording.mp4"
+        write_meeting_meta(job_dir, detection)
         command_file = Path(config.get("dashboard_command_file", default_dashboard_command_file())).expanduser()
         ensure_dashboard_running(config)
         write_dashboard_command(config, command_file, "start", job_dir.name, audio_path, detection)
@@ -416,6 +504,7 @@ def start_recording(config: dict[str, Any], detection: Detection) -> tuple[subpr
     job_dir = output_dir / f"{timestamp_slug()}-{provider_slug}"
     job_dir.mkdir(parents=True, exist_ok=True)
     audio_path = job_dir / f"recording.{audio_ext}"
+    write_meeting_meta(job_dir, detection)
     status_path = Path(config["status_file"]).expanduser() if config.get("status_file") else None
     full_command = with_placeholders(command, audio_path, status_path)
     stdout_path = job_dir / "recorder.out.log"
@@ -486,32 +575,109 @@ def stop_recording(config: dict[str, Any], proc: subprocess.Popen[str] | Dashboa
             proc.kill()
 
 
+API_KEY_ENVS = ("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY")
+RECORDING_NAMES = ("recording.mp4", "recording.m4a", "recording.wav")
+
+
+def worker_command(config: dict[str, Any], audio_path: Path) -> list[str] | None:
+    """Build the transcription worker command, or None (with a log line) if it cannot run."""
+    if not any(os.environ.get(name) for name in API_KEY_ENVS) and config.get("transcribe_provider") != "local_whisper":
+        log(config, "Skipping transcription; no transcription API key is set")
+        return None
+    worker = Path(config.get("transcription_worker", ROOT / "transcribe_recording.py")).expanduser()
+    if not worker.exists():
+        log(config, f"Skipping transcription; worker not found: {worker}")
+        return None
+    default_python = Path("~/.meeting-transcriber/venv/bin/python").expanduser()
+    python = str(
+        config.get("transcribe_python")
+        or os.environ.get("TRANSCRIBE_PYTHON")
+        or (default_python if default_python.exists() else sys.executable)
+    )
+    return [str(Path(python).expanduser()), str(worker), "--recording", str(audio_path), "--config", str(DEFAULT_CONFIG)]
+
+
+# --------------------------------------------------------------------------- #
+# Catch-up transcription
+#
+# The dashboard only starts the worker when a recording ends cleanly. If the
+# capture stream stops with an error (screen lock, sleep, app restart) or the
+# dashboard quits while the worker runs, a perfectly usable recording is left
+# without a transcript. The watcher therefore sweeps for such jobs and
+# transcribes them in the background.
+# --------------------------------------------------------------------------- #
+
+def job_recording(job_dir: Path) -> Path | None:
+    for name in RECORDING_NAMES:
+        path = job_dir / name
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
+def job_needs_transcription(job_dir: Path, now: float, min_age_s: float, max_age_s: float) -> Path | None:
+    """Return the recording of a job that was never handed to the worker, else None."""
+    recording = job_recording(job_dir)
+    if recording is None:
+        return None
+    # progress.json is the worker's first write, so its presence means the job was
+    # already attempted (done, skipped, or failed) and must not be retried in a loop.
+    if (job_dir / "progress.json").exists() or any(job_dir.glob("transcript.*")):
+        return None
+    age = now - recording.stat().st_mtime
+    if age < min_age_s or age > max_age_s:
+        return None
+    return recording
+
+
+def dashboard_is_recording(config: dict[str, Any], now: float, stale_after_s: float = 60) -> bool:
+    status_path = Path(config.get("status_file", "~/.meeting-transcriber/status.json")).expanduser()
+    status = read_json_object(status_path)
+    if not status or not status.get("recording"):
+        return False
+    try:
+        return now - status_path.stat().st_mtime <= stale_after_s
+    except OSError:
+        return False
+
+
+def find_catchup_job(config: dict[str, Any], now: float, exclude: Path | None = None) -> Path | None:
+    output_dir = Path(config.get("output_dir", DEFAULT_OUTPUT)).expanduser()
+    if not output_dir.exists():
+        return None
+    min_age = float(config.get("catchup_min_age_minutes", 10)) * 60
+    max_age = float(config.get("catchup_max_age_hours", 48)) * 3600
+    for job_dir in sorted((p for p in output_dir.iterdir() if p.is_dir()), reverse=True):
+        if exclude is not None and job_dir == exclude:
+            continue
+        recording = job_needs_transcription(job_dir, now, min_age, max_age)
+        if recording is not None:
+            return recording
+    return None
+
+
+def start_catchup(config: dict[str, Any], audio_path: Path) -> subprocess.Popen[str] | None:
+    cmd = worker_command(config, audio_path)
+    if cmd is None:
+        return None
+    log_path = audio_path.parent / "catchup-transcription.log"
+    try:
+        with log_path.open("w", encoding="utf-8") as handle:
+            return subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT, text=True)
+    except OSError as exc:
+        log(config, f"Could not start catch-up transcription for {audio_path.parent}: {exc}")
+        return None
+
+
 def transcribe(config: dict[str, Any], audio_path: Path) -> None:
     if not config.get("transcribe_after_recording", True):
         return
     if not audio_path.exists() or audio_path.stat().st_size == 0:
         log(config, f"Skipping transcription; audio file is missing or empty: {audio_path}")
         return
-    if not os.environ.get("OPENAI_API_KEY"):
-        log(config, "Skipping transcription; OPENAI_API_KEY is not set")
+    cmd = worker_command(config, audio_path)
+    if cmd is None:
         return
-
-    worker = Path(config.get("transcription_worker", ROOT / "transcribe_recording.py")).expanduser()
-    if not worker.exists():
-        log(config, f"Skipping transcription; worker not found: {worker}")
-        return
-
-    default_transcribe_python = Path("~/.meeting-transcriber/venv/bin/python").expanduser()
-    transcribe_python = str(config.get("transcribe_python") or os.environ.get("TRANSCRIBE_PYTHON") or (default_transcribe_python if default_transcribe_python.exists() else sys.executable))
-
-    cmd = [
-        transcribe_python,
-        str(worker),
-        "--recording",
-        str(audio_path),
-        "--config",
-        str(DEFAULT_CONFIG),
-    ]
     log(config, f"Transcribing job in {audio_path.parent}")
     result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if result.returncode == 0:
@@ -525,6 +691,8 @@ def watch(config_path: Path, once: bool = False) -> int:
     poll_seconds = int(config.get("poll_seconds", 10))
     start_after_hits = int(config.get("start_after_consecutive_detections", 2))
     stop_after_misses = int(config.get("stop_after_consecutive_misses", 4))
+    recording_stop_misses = int(config.get("stop_after_consecutive_misses_while_recording", 18))
+    subject_memory = int(config.get("teams_subject_memory_seconds", 300))
     max_minutes = int(config.get("max_recording_minutes", 180))
     stop_grace = int(config.get("recorder_stop_grace_seconds", 20))
 
@@ -532,6 +700,13 @@ def watch(config_path: Path, once: bool = False) -> int:
     misses = 0
     session = ActiveRecording()
     suppression_misses = 0
+    recent_subject = ""
+    recent_subject_at = 0.0
+    was_sticky = False
+    last_titles: list[str] = []
+    catchup_proc: subprocess.Popen[str] | None = None
+    catchup_job: Path | None = None
+    last_catchup_scan = 0.0
 
     log(config, "Meeting transcriber watcher started")
     sweep_orphan_job_folders(config)
@@ -542,13 +717,49 @@ def watch(config_path: Path, once: bool = False) -> int:
             poll_seconds = int(config.get("poll_seconds", poll_seconds))
             start_after_hits = int(config.get("start_after_consecutive_detections", start_after_hits))
             stop_after_misses = int(config.get("stop_after_consecutive_misses", stop_after_misses))
+            recording_stop_misses = int(
+                config.get("stop_after_consecutive_misses_while_recording", recording_stop_misses)
+            )
+            subject_memory = int(config.get("teams_subject_memory_seconds", subject_memory))
             max_minutes = int(config.get("max_recording_minutes", max_minutes))
             stop_grace = int(config.get("recorder_stop_grace_seconds", stop_grace))
 
-        detection = detect_meeting(config)
+        if config.get("log_teams_window_titles"):
+            current_titles = teams_window_titles()
+            if current_titles != last_titles:
+                log(config, "Teams windows: " + ("; ".join(current_titles) or "(none)"))
+                last_titles = current_titles
+
+        sticky: list[str] = []
+        if session.detection is not None and session.detection.subject:
+            sticky.append(session.detection.subject)
+        if recent_subject and time.time() - recent_subject_at <= subject_memory and recent_subject not in sticky:
+            sticky.append(recent_subject)
+
+        detection = detect_meeting(config, sticky)
         if once:
             log(config, f"Detection: {detection}" if detection else "Detection: none")
             return 0
+
+        meeting_switched = False
+        if detection is not None and detection.subject and detection.source != STICKY_SOURCE:
+            recent_subject, recent_subject_at = detection.subject, time.time()
+            current = session.detection
+            if session.recorder is not None and current is not None:
+                if not current.subject:
+                    current.subject = detection.subject
+                elif detection.subject.casefold() != current.subject.casefold():
+                    meeting_switched = True
+                    log(config, f"Different meeting detected ('{detection.subject}'); closing '{current.subject}'")
+
+        if session.recorder is not None:
+            now_sticky = detection is not None and detection.source == STICKY_SOURCE
+            if now_sticky and not was_sticky:
+                log(config, f"Meeting window in focus; keeping recording alive for '{detection.subject}'")
+            was_sticky = now_sticky
+            if detection is None and misses == 0:
+                titles = "; ".join(teams_window_titles()[:6]) or "(no Teams windows)"
+                log(config, f"Meeting not detected while recording; Teams windows: {titles}")
 
         suppression = read_auto_suppression(config)
         acknowledgement = read_dashboard_ack(config)
@@ -584,18 +795,49 @@ def watch(config_path: Path, once: bool = False) -> int:
 
         if session.recorder is not None:
             too_long = session.started_at is not None and (time.time() - session.started_at) > max_minutes * 60
-            if misses >= stop_after_misses or too_long or session.recorder.poll() is not None:
+            # A short focus change must never split a meeting: while recording we wait
+            # `stop_after_consecutive_misses_while_recording` polls (default 3 min).
+            lost = misses >= recording_stop_misses
+            if lost or meeting_switched or too_long or session.recorder.poll() is not None:
                 recorder = session.recorder
                 finished_audio = session.audio_path
+                finished_subject = session.detection.subject if session.detection else ""
                 dashboard_recording = isinstance(recorder, DashboardCommandProcess)
                 if not dashboard_recording and recorder.poll() is not None:
                     log_recorder_failure(config, recorder, finished_audio)
+                if lost:
+                    log(config, f"Meeting not seen for {misses * poll_seconds}s; stopping")
                 stop_recording(config, recorder, stop_grace)
                 session.clear()
+                was_sticky = False
+                # Forget the subject of the meeting that just ended so a lingering
+                # meeting chat window cannot immediately restart a recording.
+                if finished_subject and not meeting_switched and recent_subject.casefold() == finished_subject.casefold():
+                    recent_subject = ""
                 hits = 0
                 misses = 0
                 if finished_audio and not dashboard_recording:
                     transcribe(config, finished_audio)
+
+        # Background catch-up: never block meeting detection on a transcription.
+        if catchup_proc is not None and catchup_proc.poll() is not None:
+            outcome = "done" if catchup_proc.returncode == 0 else f"failed (exit {catchup_proc.returncode})"
+            log(config, f"Catch-up transcription {outcome}: {catchup_job}")
+            catchup_proc, catchup_job = None, None
+        now = time.time()
+        if (
+            config.get("catchup_transcription", True)
+            and catchup_proc is None
+            and session.recorder is None
+            and now - last_catchup_scan >= float(config.get("catchup_scan_minutes", 5)) * 60
+            and not dashboard_is_recording(config, now)
+        ):
+            last_catchup_scan = now
+            pending = find_catchup_job(config, now)
+            if pending is not None:
+                log(config, f"Recording was never transcribed; transcribing it now: {pending.parent}")
+                catchup_proc = start_catchup(config, pending)
+                catchup_job = pending.parent if catchup_proc else None
 
         time.sleep(poll_seconds)
 

@@ -59,6 +59,19 @@ Dependencies are pinned in [`requirements.txt`](requirements.txt).
   --config config.json
 ```
 
+## Merge a meeting that was split into several jobs
+
+If a meeting still ends up in several job folders, stitch them into one
+time-ordered Markdown document with gaps marked, plus one fresh summary:
+
+```bash
+~/.meeting-transcriber/venv/bin/python merge_fragments.py --auto \
+  --since 20260930-1600 --until 20260930-1800 --config ~/.meeting-transcriber/app/config.json
+```
+
+The result is written to `<first job>/merged.md` (or `--out`). New jobs also
+store `meeting.json` with the detected subject, which the merge uses as title.
+
 ## Tests
 
 Pure-function unit tests — no network, no macOS APIs, no OpenAI SDK required:
@@ -76,7 +89,13 @@ defaults shown when omitted. `~` is expanded in path values.
 |---|---|---|
 | `poll_seconds` | `10` | Seconds between detection passes. |
 | `start_after_consecutive_detections` | `2` | Hits in a row before recording starts (debounces false triggers). |
-| `stop_after_consecutive_misses` | `4` | Misses in a row before recording stops. |
+| `stop_after_consecutive_misses` | `4` | Misses in a row before a suppression is cleared (idle state). |
+| `stop_after_consecutive_misses_while_recording` | `18` | Misses in a row before an **active** recording stops (18 × 10 s = 3 min), so a focus change never splits a meeting. |
+| `teams_subject_memory_seconds` | `300` | How long a Teams meeting subject seen on the join screen / compact view is remembered, so the meeting window (whose title lacks the word "Meeting") still counts as the meeting. While recording, the subject is kept for the whole meeting. |
+| `log_teams_window_titles` | `false` | Diagnostics: log every change in Teams window titles. |
+| `catchup_transcription` | `true` | Background sweep that transcribes recordings left without a transcript (e.g. the capture stream stopped with an error, or the dashboard quit mid-transcription). |
+| `catchup_min_age_minutes` / `catchup_max_age_hours` | `10` / `48` | Only recordings in this age window are swept; older backlog is left for you to decide. |
+| `catchup_scan_minutes` | `5` | How often the sweep runs (one job at a time, never while recording). |
 | `max_recording_minutes` | `180` | Hard cap on a single recording. |
 | `output_dir` | `~/.meeting-transcriber/output` | Where job folders are written. |
 | `log_file` | `~/.meeting-transcriber/meeting-transcriber.log` | Watcher log. |
