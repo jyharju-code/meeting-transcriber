@@ -109,6 +109,10 @@ def gemini_http(req: "urllib.request.Request", timeout: int, attempts: int = 6) 
                         "Gemini project spend cap reached; raise it at https://ai.studio/spend "
                         "(it resets on the 1st of each month, PST)."
                     ) from exc
+                if gemini_is_model_daily_limit(body):
+                    # e.g. "limit: 100 requests per day on Tier 1" for gemini-3.5-transcribe:
+                    # minutes of backoff cannot help, the caller should switch model.
+                    raise GeminiModelLimited(body[:300], gemini_retry_seconds(body)) from exc
             if exc.code in (429, 500, 503) and attempt < attempts - 1:
                 time.sleep(delay)
                 delay = min(delay * 2, 90.0)
@@ -123,6 +127,29 @@ class GeminiSpendCapReached(ProviderError):
 def gemini_is_spend_cap(body: str) -> bool:
     text = body.casefold()
     return "spending cap" in text or "spend cap" in text
+
+
+class GeminiModelLimited(ProviderError):
+    """One model hit its per-day request limit; other models may still work."""
+
+    def __init__(self, message: str, retry_seconds: float):
+        super().__init__(message)
+        self.retry_seconds = retry_seconds
+
+
+def gemini_is_model_daily_limit(body: str) -> bool:
+    text = body.casefold()
+    return "per day" in text or "perday" in text
+
+
+def gemini_retry_seconds(body: str, default: float = 3600.0) -> float:
+    import re
+
+    match = re.search(r"retry in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?", body)
+    if not match or not any(match.groups()):
+        return default
+    hours, minutes, seconds = (float(g) if g else 0.0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def gemini_looks_degenerate(text: str) -> bool:
@@ -398,6 +425,7 @@ class GeminiTranscriber(Transcriber):
         self.key_env = key_env
         self.ffmpeg = ffmpeg
         self.model_label = self.model
+        self._blocked_until: dict[str, float] = {}
 
     def available(self) -> bool:
         return bool(gemini_key(self.key_env))
@@ -434,21 +462,30 @@ class GeminiTranscriber(Transcriber):
         text = ""
         used = "none"
         last_error: Exception | None = None
+        answered = False  # some model responded without error (possibly empty = silence)
         for model in attempts:
+            if self._blocked_until.get(model, 0.0) > time.time():
+                continue  # this model hit its daily limit earlier in the job
             try:
                 file_uri = gemini_upload_file(api_key, flac, "audio/flac")
                 candidate = self._run(api_key, file_uri, model)
             except GeminiSpendCapReached:
                 raise
+            except GeminiModelLimited as exc:
+                self._blocked_until[model] = time.time() + exc.retry_seconds
+                last_error = exc
+                print(f"providers: {model} daily limit reached; using fallback for this job", file=sys.stderr)
+                continue
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 # A per-model rate limit or outage: move on to the next model.
                 last_error = exc
                 print(f"providers: {model} failed for {snippet.name}: {exc}", file=sys.stderr)
                 continue
+            answered = True
             if candidate and not gemini_looks_degenerate(candidate):
                 text, used = candidate, model
                 break
-        if not text and last_error is not None:
+        if not text and not answered and last_error is not None:
             # Fail the job (so it is retried later) rather than saving a hole.
             raise ProviderError(f"Gemini could not transcribe {snippet.name}: {last_error}")
         if not text:

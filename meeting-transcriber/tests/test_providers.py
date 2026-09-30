@@ -5,6 +5,7 @@ No network, no OpenAI SDK, no whisper binary required.
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -145,6 +146,37 @@ class GeminiTests(unittest.TestCase):
         body = '{"error":{"message":"Your project has exceeded its monthly spending cap. Please go to AI Studio","code":"too_many_requests"}}'
         self.assertTrue(providers.gemini_is_spend_cap(body))
         self.assertFalse(providers.gemini_is_spend_cap('{"error":{"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded per minute"}}'))
+
+    def test_model_daily_limit_is_recognised(self):
+        body = '{"error":{"message":"Rate limit exceeded for model gemini-3.5-transcribe (limit: 100 requests per day on Tier 1). Please retry in 2h59m10s or upgrade your tier","code":"too_many_requests"}}'
+        self.assertTrue(providers.gemini_is_model_daily_limit(body))
+        self.assertFalse(providers.gemini_is_spend_cap(body))
+        self.assertEqual(providers.gemini_retry_seconds(body), 2 * 3600 + 59 * 60 + 10)
+        self.assertEqual(providers.gemini_retry_seconds("no hint"), 3600.0)
+
+    def test_silence_from_fallback_is_not_an_error(self):
+        t = providers.GeminiTranscriber("gemini")
+        limited = providers.GeminiModelLimited("per day", 3600)
+        calls = []
+
+        def run(_key, _uri, model):
+            calls.append(model)
+            if model == "gemini-3.5-transcribe":
+                raise limited
+            return ""  # flash answered: the snippet is silent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snippet = Path(tmp) / "snippet-001.m4a"
+            snippet.write_bytes(b"x")
+            with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g"}, clear=True), \
+                 mock.patch.object(t, "_to_flac", return_value=snippet), \
+                 mock.patch.object(providers, "gemini_upload_file", return_value="uri"), \
+                 mock.patch.object(t, "_run", side_effect=run):
+                text, raw = t.transcribe(snippet)
+                self.assertEqual(text, "")
+                # the limited model is skipped for the rest of the job
+                t.transcribe(snippet)
+        self.assertEqual(calls.count("gemini-3.5-transcribe"), 1)
 
     def test_key_env_precedence(self):
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g", "GOOGLE_API_KEY": "x"}, clear=True):
