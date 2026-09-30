@@ -156,6 +156,16 @@ def transcribe_snippets(
     effective_parallel = max(1, min(max_parallel, getattr(transcriber, "max_parallel", max_parallel)))
 
     def transcribe_one(index: int, snippet: Path) -> dict[str, Any]:
+        # Resume: a snippet already transcribed by this same engine in an earlier,
+        # interrupted run is reused instead of being paid for again.
+        saved = snippet_transcript_dir / f"{snippet.stem}.json"
+        if saved.exists():
+            try:
+                previous = json.loads(saved.read_text(encoding="utf-8"))
+                if previous.get("model") == transcriber.model_label and str(previous.get("text", "")).strip():
+                    return previous
+            except (OSError, ValueError):
+                pass
         text, raw = transcriber.transcribe(snippet)
         payload: dict[str, Any] = {
             "index": index,
@@ -424,14 +434,19 @@ def main() -> int:
         progress, stage="starting", progress=0.02,
         message=f"Transcribing with {transcriber.model_label}",
     )
-    snippets = split_snippets(recording, job_dir / "snippets", chunk_seconds, progress)
-    text, chunks, diarized_chunks = transcribe_snippets(
-        transcriber,
-        snippets,
-        job_dir,
-        max_parallel,
-        progress,
-    )
+    try:
+        snippets = split_snippets(recording, job_dir / "snippets", chunk_seconds, progress)
+        text, chunks, diarized_chunks = transcribe_snippets(
+            transcriber,
+            snippets,
+            job_dir,
+            max_parallel,
+            progress,
+        )
+    except Exception as exc:  # noqa: BLE001 - record any failure so it can be retried
+        write_progress(progress, stage="error", progress=1.0, message=f"Transcription failed: {exc}")
+        print(f"transcribe_recording: transcription failed: {exc}", file=sys.stderr)
+        return 1
     write_transcript_outputs(job_dir, requested_format, text, chunks, diarized_chunks)
     if summary_enabled:
         summarize(

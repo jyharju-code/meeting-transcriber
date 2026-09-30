@@ -97,11 +97,32 @@ def gemini_http(req: "urllib.request.Request", timeout: int, attempts: int = 6) 
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+                if gemini_is_spend_cap(body):
+                    # Waiting cannot help: the project's monthly cap blocks every model.
+                    raise GeminiSpendCapReached(
+                        "Gemini project spend cap reached; raise it at https://ai.studio/spend "
+                        "(it resets on the 1st of each month, PST)."
+                    ) from exc
             if exc.code in (429, 500, 503) and attempt < attempts - 1:
                 time.sleep(delay)
                 delay = min(delay * 2, 90.0)
                 continue
             raise
+
+
+class GeminiSpendCapReached(ProviderError):
+    """The Gemini project's monthly spend cap blocks all requests."""
+
+
+def gemini_is_spend_cap(body: str) -> bool:
+    text = body.casefold()
+    return "spending cap" in text or "spend cap" in text
 
 
 def gemini_looks_degenerate(text: str) -> bool:
@@ -408,14 +429,28 @@ class GeminiTranscriber(Transcriber):
         attempts = [self.model, self.model]
         if self.fallback_model and self.fallback_model != self.model:
             attempts.append(self.fallback_model)
+        import urllib.error
+
         text = ""
         used = "none"
+        last_error: Exception | None = None
         for model in attempts:
-            file_uri = gemini_upload_file(api_key, flac, "audio/flac")
-            candidate = self._run(api_key, file_uri, model)
+            try:
+                file_uri = gemini_upload_file(api_key, flac, "audio/flac")
+                candidate = self._run(api_key, file_uri, model)
+            except GeminiSpendCapReached:
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                # A per-model rate limit or outage: move on to the next model.
+                last_error = exc
+                print(f"providers: {model} failed for {snippet.name}: {exc}", file=sys.stderr)
+                continue
             if candidate and not gemini_looks_degenerate(candidate):
                 text, used = candidate, model
                 break
+        if not text and last_error is not None:
+            # Fail the job (so it is retried later) rather than saving a hole.
+            raise ProviderError(f"Gemini could not transcribe {snippet.name}: {last_error}")
         if not text:
             print(f"providers: Gemini produced no usable transcript for {snippet.name}", file=sys.stderr)
         return text, {"text": text, "model": used, "engine": f"gemini:{used}"}

@@ -327,6 +327,30 @@ class CatchupTests(unittest.TestCase):
             found = mt.find_catchup_job({"output_dir": str(root)}, now)
             self.assertEqual(found, newer / "recording.mp4")
 
+    def test_failed_attempt_is_retried_later_but_not_forever(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            now = 1_000_000.0
+            job = self.make_job(Path(tmp), "20261001-080000-microsoft-teams", 3 * 3600, now)
+            progress = job / "progress.json"
+            progress.write_text('{"stage": "error"}', encoding="utf-8")
+            os.utime(progress, (now - 600, now - 600))
+            self.assertIsNone(mt.job_needs_transcription(job, now, 600, 48 * 3600, 3600, 6))  # too soon
+            os.utime(progress, (now - 7200, now - 7200))
+            self.assertIsNotNone(mt.job_needs_transcription(job, now, 600, 48 * 3600, 3600, 6))  # retry
+            (job / mt.CATCHUP_ATTEMPTS_FILE).write_text("6")
+            self.assertIsNone(mt.job_needs_transcription(job, now, 600, 48 * 3600, 3600, 6))  # gave up
+
+    def test_done_job_is_never_retried(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            now = 1_000_000.0
+            job = self.make_job(Path(tmp), "j", 3 * 3600, now)
+            progress = job / "progress.json"
+            progress.write_text('{"stage": "skipped"}', encoding="utf-8")
+            os.utime(progress, (now - 7200, now - 7200))
+            self.assertIsNone(mt.job_needs_transcription(job, now, 600, 48 * 3600))
+
     def test_stale_recording_status_does_not_block(self):
         import os
         with tempfile.TemporaryDirectory() as tmp:

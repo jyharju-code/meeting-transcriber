@@ -615,15 +615,42 @@ def job_recording(job_dir: Path) -> Path | None:
     return None
 
 
-def job_needs_transcription(job_dir: Path, now: float, min_age_s: float, max_age_s: float) -> Path | None:
-    """Return the recording of a job that was never handed to the worker, else None."""
+CATCHUP_ATTEMPTS_FILE = "catchup-attempts.txt"
+
+
+def catchup_attempts(job_dir: Path) -> int:
+    try:
+        return int((job_dir / CATCHUP_ATTEMPTS_FILE).read_text().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def job_needs_transcription(
+    job_dir: Path,
+    now: float,
+    min_age_s: float,
+    max_age_s: float,
+    retry_after_s: float = 3600,
+    max_attempts: int = 6,
+) -> Path | None:
+    """Return the recording of a job that still needs a transcript, else None.
+
+    Never-attempted jobs qualify at once. A failed attempt (stage "error", or a
+    progress file that stopped updating, e.g. the spend cap was hit or the worker
+    died) is retried every `retry_after_s`, at most `max_attempts` times.
+    """
     recording = job_recording(job_dir)
-    if recording is None:
+    if recording is None or any(job_dir.glob("transcript.*")):
         return None
-    # progress.json is the worker's first write, so its presence means the job was
-    # already attempted (done, skipped, or failed) and must not be retried in a loop.
-    if (job_dir / "progress.json").exists() or any(job_dir.glob("transcript.*")):
-        return None
+    progress = job_dir / "progress.json"
+    if progress.exists():
+        state = read_json_object(progress) or {}
+        if state.get("stage") in ("done", "skipped"):
+            return None
+        if now - progress.stat().st_mtime < retry_after_s:
+            return None  # running, or failed too recently
+        if catchup_attempts(job_dir) >= max_attempts:
+            return None
     age = now - recording.stat().st_mtime
     if age < min_age_s or age > max_age_s:
         return None
@@ -647,10 +674,12 @@ def find_catchup_job(config: dict[str, Any], now: float, exclude: Path | None = 
         return None
     min_age = float(config.get("catchup_min_age_minutes", 10)) * 60
     max_age = float(config.get("catchup_max_age_hours", 48)) * 3600
+    retry_after = float(config.get("catchup_retry_minutes", 60)) * 60
+    max_attempts = int(config.get("catchup_max_attempts", 6))
     for job_dir in sorted((p for p in output_dir.iterdir() if p.is_dir()), reverse=True):
         if exclude is not None and job_dir == exclude:
             continue
-        recording = job_needs_transcription(job_dir, now, min_age, max_age)
+        recording = job_needs_transcription(job_dir, now, min_age, max_age, retry_after, max_attempts)
         if recording is not None:
             return recording
     return None
@@ -662,6 +691,7 @@ def start_catchup(config: dict[str, Any], audio_path: Path) -> subprocess.Popen[
         return None
     log_path = audio_path.parent / "catchup-transcription.log"
     try:
+        (audio_path.parent / CATCHUP_ATTEMPTS_FILE).write_text(str(catchup_attempts(audio_path.parent) + 1))
         with log_path.open("w", encoding="utf-8") as handle:
             return subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT, text=True)
     except OSError as exc:

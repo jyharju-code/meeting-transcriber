@@ -141,6 +141,11 @@ class GeminiTests(unittest.TestCase):
         self.assertFalse(providers.gemini_looks_degenerate("Tämä on ihan tavallinen suomenkielinen virke joka jatkuu eteenpäin."))
         self.assertFalse(providers.gemini_looks_degenerate("mutta mutta"))  # too short to judge
 
+    def test_spend_cap_is_recognised(self):
+        body = '{"error":{"message":"Your project has exceeded its monthly spending cap. Please go to AI Studio","code":"too_many_requests"}}'
+        self.assertTrue(providers.gemini_is_spend_cap(body))
+        self.assertFalse(providers.gemini_is_spend_cap('{"error":{"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded per minute"}}'))
+
     def test_key_env_precedence(self):
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g", "GOOGLE_API_KEY": "x"}, clear=True):
             self.assertEqual(providers.gemini_key(), "g")
