@@ -102,11 +102,11 @@ def build_document(jobs: list[Path], title: str) -> tuple[str, str, dict[str, An
             gap = (start - previous_end).total_seconds()
             gaps.append((previous_end, start))
             parts.append(
-                f"> **[AUKKO {fmt_clock(previous_end)}–{fmt_clock(start)}, {fmt_span(gap)}: "
+                f"> **[AUKKO {fmt_clock(previous_end)}-{fmt_clock(start)}, {fmt_span(gap)}: "
                 "tältä ajalta ei tallentunut ääntä]**\n"
             )
         text = transcript_text(job) or "_(ei litteraattia)_"
-        parts.append(f"### Osa {index} · {fmt_clock(start)}–{fmt_clock(end)} ({fmt_span(length)})\n\n{text}\n")
+        parts.append(f"### Osa {index} · {fmt_clock(start)}-{fmt_clock(end)} ({fmt_span(length)})\n\n{text}\n")
         plain.append(text)
         rows.append(f"| {index} | `{job.name}` | {fmt_clock(start)} | {fmt_clock(end)} | {fmt_span(length)} |")
         previous_end = end
@@ -119,7 +119,7 @@ def build_document(jobs: list[Path], title: str) -> tuple[str, str, dict[str, An
     header = [
         f"# {title}" if title else f"# Kokous {first:%d.%m.%Y}",
         "",
-        f"**Päivä:** {first:%d.%m.%Y} · **Tallenne:** {fmt_clock(first)}–{fmt_clock(previous_end)} · "
+        f"**Päivä:** {first:%d.%m.%Y} · **Tallenne:** {fmt_clock(first)}-{fmt_clock(previous_end)} · "
         f"**Tallentunut ääni:** {fmt_span(recorded)} · **Aukkoja:** {len(gaps)} (yht. {fmt_span(lost)})",
         "",
         "> Koottu automaattisesti useasta tallennepätkästä aikajärjestyksessä. "
