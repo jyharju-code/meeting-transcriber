@@ -139,12 +139,39 @@ def result_jsonable(result: Any) -> Any:
     return {"text": transcript_text(result)}
 
 
+DEFAULT_SILENCE_MEAN_DB = -45.0
+
+
+def snippet_mean_volume(snippet: Path) -> float | None:
+    """Mean volume (dBFS) of a snippet via ffmpeg volumedetect, or None if unknown."""
+    ffmpeg = "/opt/homebrew/bin/ffmpeg" if Path("/opt/homebrew/bin/ffmpeg").exists() else "ffmpeg"
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostats", "-i", str(snippet), "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    for line in result.stderr.splitlines():
+        if "mean_volume:" in line:
+            try:
+                return float(line.split("mean_volume:")[1].split("dB")[0])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def snippet_is_silent(mean_db: float | None, threshold_db: float | None) -> bool:
+    """A 3-minute snippet whose mean level is below about -45 dBFS holds at most
+    ~0.5 s of normal-level speech (one second of speech already lifts the mean to
+    about -42 dB), so it is not worth sending to a paid API."""
+    return threshold_db is not None and mean_db is not None and mean_db < threshold_db
+
+
 def transcribe_snippets(
     transcriber: "providers.Transcriber",
     snippets: list[Path],
     job_dir: Path,
     max_parallel: int,
     progress: Path | None,
+    silence_threshold_db: float | None = None,
 ) -> tuple[str, list[dict[str, Any]], list[Any]]:
     snippet_transcript_dir = job_dir / "snippets" / "transcripts"
     snippet_transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -166,6 +193,13 @@ def transcribe_snippets(
                     return previous
             except (OSError, ValueError):
                 pass
+        if silence_threshold_db is not None:
+            mean_db = snippet_mean_volume(snippet)
+            if snippet_is_silent(mean_db, silence_threshold_db):
+                payload = {"index": index, "file": str(snippet), "model": transcriber.model_label,
+                           "text": "", "raw": {"skipped": "silence", "mean_db": mean_db}}
+                saved.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+                return payload
         text, raw = transcriber.transcribe(snippet)
         payload: dict[str, Any] = {
             "index": index,
@@ -436,13 +470,22 @@ def main() -> int:
     )
     try:
         snippets = split_snippets(recording, job_dir / "snippets", chunk_seconds, progress)
+        silence_db = (
+            float(config.get("silence_mean_db", DEFAULT_SILENCE_MEAN_DB))
+            if config.get("skip_silent_snippets", True) and transcriber.name != "local_whisper"
+            else None
+        )
         text, chunks, diarized_chunks = transcribe_snippets(
             transcriber,
             snippets,
             job_dir,
             max_parallel,
             progress,
+            silence_db,
         )
+        skipped = sum(1 for c in chunks if isinstance(c.get("raw"), dict) and c["raw"].get("skipped") == "silence")
+        if skipped:
+            print(f"transcribe_recording: skipped {skipped}/{len(chunks)} silent snippets", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - record any failure so it can be retried
         write_progress(progress, stage="error", progress=1.0, message=f"Transcription failed: {exc}")
         print(f"transcribe_recording: transcription failed: {exc}", file=sys.stderr)

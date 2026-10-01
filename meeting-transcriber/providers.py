@@ -209,7 +209,8 @@ def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model) -
     )
     body = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime, "file_uri": file_uri}}]}],
-        "generationConfig": {"temperature": 0},
+        # Transcription needs no reasoning; thinking tokens were ~20 % of the bill.
+        "generationConfig": {"temperature": 0, "thinkingConfig": {"thinkingBudget": 0}},
     }
     req = urllib.request.Request(
         f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={api_key}",

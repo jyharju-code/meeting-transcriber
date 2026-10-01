@@ -84,5 +84,15 @@ class BuildSummaryPromptTests(unittest.TestCase):
         self.assertNotIn("x" * 101, prompt)
 
 
+class SilenceGateTests(unittest.TestCase):
+    def test_threshold(self):
+        import transcribe_recording as tr
+        self.assertTrue(tr.snippet_is_silent(-50.9, -45.0))      # 18.9 tail: no speech
+        self.assertFalse(tr.snippet_is_silent(-38.4, -45.0))     # sound present
+        self.assertFalse(tr.snippet_is_silent(-21.9, -45.0))     # normal meeting speech
+        self.assertFalse(tr.snippet_is_silent(None, -45.0))      # unknown -> transcribe
+        self.assertFalse(tr.snippet_is_silent(-80.0, None))      # gate disabled
+
+
 if __name__ == "__main__":
     unittest.main()

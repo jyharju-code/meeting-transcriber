@@ -96,6 +96,7 @@ defaults shown when omitted. `~` is expanded in path values.
 | `catchup_transcription` | `true` | Background sweep that transcribes recordings left without a transcript (e.g. the capture stream stopped with an error, or the dashboard quit mid-transcription). |
 | `catchup_min_age_minutes` / `catchup_max_age_hours` | `10` / `48` | Only recordings in this age window are swept; older backlog is left for you to decide. |
 | `catchup_scan_minutes` | `5` | How often the sweep runs (one job at a time, never while recording). |
+| `skip_silent_snippets` / `silence_mean_db` | `true` / `-45` | Do not send a snippet to a paid API when its mean level is below this (a 3-min snippet under -45 dBFS holds at most ~0.5 s of normal speech). Saves money on recordings that ran on after the meeting. |
 | `max_recording_minutes` | `180` | Hard cap on a single recording. |
 | `output_dir` | `~/.meeting-transcriber/output` | Where job folders are written. |
 | `log_file` | `~/.meeting-transcriber/meeting-transcriber.log` | Watcher log. |
