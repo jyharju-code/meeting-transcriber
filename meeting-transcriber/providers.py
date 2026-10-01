@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -152,8 +154,21 @@ def gemini_retry_seconds(body: str, default: float = 3600.0) -> float:
     return hours * 3600 + minutes * 60 + seconds
 
 
+# The general model (gemini-3.5-flash) sometimes "thinks aloud" into the
+# transcript when unsure of a word ("Let's listen to 2:03 again", quoted
+# alternatives joined with "or" / "->") and then loops on one phrase.
+GEMINI_META_RE = re.compile(
+    r"let's (listen|write|review|check|transcribe|re-?listen)|is what it sounds like"
+    r"|\" or \"|\" -> \"|->\s*\"",
+    re.I,
+)
+UNRELIABLE_MARKER = "[epäselvä jakso: litterointi epäonnistui]"
+
+
 def gemini_looks_degenerate(text: str) -> bool:
-    """Detect ASR collapse where one token repeats consecutively many times."""
+    """Detect unusable output: leaked reasoning, or a word/phrase repetition loop."""
+    if GEMINI_META_RE.search(text):
+        return True
     words = text.split()
     if len(words) < 40:
         return False
@@ -161,7 +176,19 @@ def gemini_looks_degenerate(text: str) -> bool:
     for a, b in zip(words, words[1:]):
         run = run + 1 if a == b else 1
         best = max(best, run)
-    return best >= 25
+    if best >= 25:
+        return True
+    # Phrase loops: one 4-word sequence covering a large share of the text.
+    grams: dict[str, int] = {}
+    for i in range(len(words) - 3):
+        key = " ".join(words[i:i + 4])
+        grams[key] = grams.get(key, 0) + 1
+    top = max(grams.values(), default=0)
+    if top >= 8 and top * 4 / len(words) >= 0.3:
+        return True
+    # Highly compressible long text is a loop (normal speech compresses to ~0.45).
+    raw = text.encode("utf-8")
+    return len(raw) >= 400 and len(zlib.compress(raw)) / len(raw) < 0.2
 
 
 def gemini_upload_file(api_key: str, path: Path, mime: str) -> str:
@@ -200,17 +227,20 @@ def gemini_transcribe_interactions(api_key, file_uri, mime, language_codes, mode
     return "".join(parts).strip()
 
 
-def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model) -> str:
+def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model, temperature: float = 0.0) -> str:
     """General multimodal model (e.g. gemini-3.5-flash) via generateContent."""
     langs = ", ".join(language_codes) if language_codes else "the spoken language"
     prompt = (
         f"Transcribe this meeting audio verbatim into clean text in {langs}. "
-        "Output only the transcript, with no timestamps, speaker labels, or commentary."
+        "Output ONLY the words that are spoken, once, in order. Never add notes, "
+        "analysis, timestamps, speaker labels, alternatives or commentary in any "
+        "language, and never repeat a passage. If a word is unclear, write [epäselvä] "
+        "and continue."
     )
     body = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime, "file_uri": file_uri}}]}],
         # Transcription needs no reasoning; thinking tokens were ~20 % of the bill.
-        "generationConfig": {"temperature": 0, "thinkingConfig": {"thinkingBudget": 0}},
+        "generationConfig": {"temperature": temperature, "thinkingConfig": {"thinkingBudget": 0}},
     }
     req = urllib.request.Request(
         f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={api_key}",
@@ -445,10 +475,12 @@ class GeminiTranscriber(Transcriber):
             raise ProviderError(result.stderr.strip() or "ffmpeg FLAC conversion failed")
         return flac
 
-    def _run(self, api_key: str, file_uri: str, model: str) -> str:
+    def _run(self, api_key: str, file_uri: str, model: str, retry: bool = False) -> str:
         if model == GEMINI_TRANSCRIBE_MODEL:
             return gemini_transcribe_interactions(api_key, file_uri, "audio/flac", self.language_codes, self.mode)
-        return gemini_transcribe_generate(api_key, file_uri, "audio/flac", self.language_codes, model)
+        # A second try at a slightly higher temperature escapes a deterministic loop.
+        return gemini_transcribe_generate(api_key, file_uri, "audio/flac", self.language_codes, model,
+                                          temperature=0.3 if retry else 0.0)
 
     def transcribe(self, snippet: Path) -> tuple[str, Any]:
         api_key = gemini_key(self.key_env)
@@ -457,19 +489,22 @@ class GeminiTranscriber(Transcriber):
         flac = self._to_flac(snippet, snippet.parent / "gemini-flac")
         attempts = [self.model, self.model]
         if self.fallback_model and self.fallback_model != self.model:
-            attempts.append(self.fallback_model)
+            attempts += [self.fallback_model, self.fallback_model]
         import urllib.error
 
         text = ""
         used = "none"
         last_error: Exception | None = None
         answered = False  # some model responded without error (possibly empty = silence)
+        unreliable = False  # a model answered with leaked reasoning or a loop
+        tried: dict[str, int] = {}
         for model in attempts:
             if self._blocked_until.get(model, 0.0) > time.time():
                 continue  # this model hit its daily limit earlier in the job
             try:
                 file_uri = gemini_upload_file(api_key, flac, "audio/flac")
-                candidate = self._run(api_key, file_uri, model)
+                candidate = self._run(api_key, file_uri, model, retry=tried.get(model, 0) > 0)
+                tried[model] = tried.get(model, 0) + 1
             except GeminiSpendCapReached:
                 raise
             except GeminiModelLimited as exc:
@@ -483,13 +518,23 @@ class GeminiTranscriber(Transcriber):
                 print(f"providers: {model} failed for {snippet.name}: {exc}", file=sys.stderr)
                 continue
             answered = True
-            if candidate and not gemini_looks_degenerate(candidate):
-                text, used = candidate, model
-                break
+            if not candidate:
+                if model != self.model:
+                    break  # the fallback heard nothing: accept silence, no extra paid call
+                continue  # the dedicated model can return empty on audio it fails on
+            if gemini_looks_degenerate(candidate):
+                unreliable = True
+                continue
+            text, used = candidate, model
+            break
         if not text and not answered and last_error is not None:
             # Fail the job (so it is retried later) rather than saving a hole.
             raise ProviderError(f"Gemini could not transcribe {snippet.name}: {last_error}")
-        if not text:
+        if not text and unreliable:
+            # Never pass leaked reasoning or a loop into the transcript; mark the gap.
+            print(f"providers: no reliable transcript for {snippet.name}; marked as unclear", file=sys.stderr)
+            text, used = UNRELIABLE_MARKER, "unreliable"
+        elif not text:
             print(f"providers: Gemini produced no usable transcript for {snippet.name}", file=sys.stderr)
         return text, {"text": text, "model": used, "engine": f"gemini:{used}"}
 

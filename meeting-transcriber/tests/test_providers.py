@@ -159,7 +159,7 @@ class GeminiTests(unittest.TestCase):
         limited = providers.GeminiModelLimited("per day", 3600)
         calls = []
 
-        def run(_key, _uri, model):
+        def run(_key, _uri, model, retry=False):
             calls.append(model)
             if model == "gemini-3.5-transcribe":
                 raise limited
@@ -177,6 +177,17 @@ class GeminiTests(unittest.TestCase):
                 # the limited model is skipped for the rest of the job
                 t.transcribe(snippet)
         self.assertEqual(calls.count("gemini-3.5-transcribe"), 1)
+
+    def test_leaked_reasoning_and_phrase_loops_are_rejected(self):
+        leaked = 'Mutta tota "uun silmään" is what it sounds like, but wait. Let\'s listen to 2:03-2:07 again.'
+        self.assertTrue(providers.gemini_looks_degenerate(leaked))
+        loop = ' '.join(['-> "tietokone... ryhmässä"'] * 60)
+        self.assertTrue(providers.gemini_looks_degenerate(loop))
+        normal = ("Joo, mä laitan sulle sen listan huomenna ja katsotaan sitten yhdessä, "
+                  "että ketkä siitä on oikeasti relevantteja tähän tilaisuuteen. ") * 3
+        self.assertFalse(providers.gemini_looks_degenerate(normal))
+        english = "The MALD is cheap. Actually, even deadlier, as it has a bigger warhead than expected in this case."
+        self.assertFalse(providers.gemini_looks_degenerate(english))
 
     def test_key_env_precedence(self):
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g", "GOOGLE_API_KEY": "x"}, clear=True):
