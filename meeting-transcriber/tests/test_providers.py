@@ -34,9 +34,10 @@ class SelectTests(unittest.TestCase):
         m = {"a": _Fake("a", False), "b": _Fake("b", True)}
         self.assertEqual(providers.select(m, "a", ["b"]).name, "b")
 
-    def test_falls_back_to_any_available_when_chain_exhausted(self):
+    def test_never_uses_a_provider_that_was_not_named(self):
+        # D3: no implicit "any other available" fallback (it used to pick up OpenAI).
         m = {"a": _Fake("a", False), "c": _Fake("c", True)}
-        self.assertEqual(providers.select(m, "a", []).name, "c")
+        self.assertIsNone(providers.select(m, "a", []))
 
     def test_returns_none_when_nothing_available(self):
         m = {"a": _Fake("a", False), "b": _Fake("b", False)}
@@ -45,48 +46,6 @@ class SelectTests(unittest.TestCase):
     def test_ignores_unknown_names(self):
         m = {"a": _Fake("a", True)}
         self.assertEqual(providers.select(m, "missing", ["a"]).name, "a")
-
-
-class OpenAIChatSummarizerTests(unittest.TestCase):
-    def test_available_requires_key(self):
-        s = providers.OpenAIChatSummarizer("openai", "https://x/v1", "OPENAI_API_KEY", "gpt-4o-mini")
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(s.available())
-        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True):
-            self.assertTrue(s.available())
-
-    def test_keyless_provider_is_always_available(self):
-        s = providers.OpenAIChatSummarizer("ollama", "http://localhost:11434/v1", None, "qwen2.5:7b")
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(s.available())
-
-
-class OpenAIAudioTranscriberTests(unittest.TestCase):
-    def test_diarize_wiring(self):
-        t = providers.OpenAIAudioTranscriber(
-            "openai", "https://x/v1", "OPENAI_API_KEY",
-            model="gpt-4o-mini-transcribe", diarize_model="gpt-4o-transcribe-diarize", diarize=True,
-        )
-        self.assertTrue(t.supports_diarization)
-        self.assertTrue(t.diarize)
-        self.assertEqual(t.model, "gpt-4o-transcribe-diarize")
-        self.assertEqual(t.response_format, "diarized_json")
-
-    def test_plain_wiring(self):
-        t = providers.OpenAIAudioTranscriber(
-            "openai", "https://x/v1", "OPENAI_API_KEY",
-            model="gpt-4o-mini-transcribe", diarize_model="gpt-4o-transcribe-diarize", diarize=False,
-        )
-        self.assertFalse(t.diarize)
-        self.assertEqual(t.model, "gpt-4o-mini-transcribe")
-        self.assertEqual(t.response_format, "json")
-
-    def test_available_requires_key(self):
-        t = providers.OpenAIAudioTranscriber("openai", None, "OPENAI_API_KEY", "gpt-4o-mini-transcribe")
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(t.available())
-        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True):
-            self.assertTrue(t.available())
 
 
 class WhisperCppTranscriberTests(unittest.TestCase):
@@ -111,29 +70,27 @@ class WhisperCppTranscriberTests(unittest.TestCase):
 
 
 class RegistryBuildTests(unittest.TestCase):
-    def test_default_registry_has_local_and_openai(self):
+    def test_default_registry_has_no_openai(self):
+        # D3: OpenAI was removed from the tool entirely.
         transcribers = providers.build_transcribers({})
         self.assertIn("local_whisper", transcribers)
-        self.assertIn("openai", transcribers)
-        summarizers = providers.build_summarizers({})
-        self.assertIn("openai", summarizers)
+        self.assertIn("gemini", transcribers)
+        self.assertNotIn("openai", transcribers)
+        self.assertNotIn("openai", providers.build_summarizers({}))
+        self.assertFalse(hasattr(providers, "OpenAIAudioTranscriber"))
+        self.assertFalse(hasattr(providers, "OpenAIChatSummarizer"))
 
-    def test_explicit_providers_block_is_used(self):
-        config = {
-            "transcribe_output_format": "md",
-            "providers": {
-                "openrouter": {
-                    "base_url": "https://openrouter.ai/api/v1",
-                    "key_env": "OPENROUTER_API_KEY",
-                    "summarize": {"type": "openai_chat", "model": "anthropic/claude-3.5-sonnet"},
-                }
-            },
-        }
-        summarizers = providers.build_summarizers(config)
-        self.assertEqual(list(summarizers), ["openrouter"])
-        self.assertEqual(summarizers["openrouter"].model, "anthropic/claude-3.5-sonnet")
-        # No transcribe block -> no transcribers from this registry.
+    def test_openai_type_in_providers_block_is_ignored(self):
+        config = {"providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1",
+                                               "summarize": {"type": "openai_chat", "model": "x"}}}}
+        self.assertEqual(providers.build_summarizers(config), {})
         self.assertEqual(providers.build_transcribers(config), {})
+
+    def test_agent_platform_only_eu(self):
+        with self.assertRaises(providers.ProviderError):
+            providers.ap_generate("p", "us", "gemini-3.5-flash", [{"text": "x"}])
+        with self.assertRaises(providers.ProviderError):
+            providers.ap_generate("p", "europe-west4", "gemini-3.5-flash", [{"text": "x"}])
 
 
 class GeminiTests(unittest.TestCase):

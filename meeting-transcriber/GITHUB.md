@@ -14,12 +14,12 @@ Do not push a parent folder that contains unrelated business files.
 Before publishing:
 
 ```bash
-rg -n "sk-|OPENAI_API_KEY=|/Users/yourname|@yourdomain" meeting-transcriber native-meeting-transcriber
+rg -n "AIza|sk-|_API_KEY=|/Users/yourname|@yourdomain" meeting-transcriber native-meeting-transcriber
 ```
 
 Expected:
 
-- references to the string `OPENAI_API_KEY` in code/docs are fine
+- references to the string `GEMINI_API_KEY` in code/docs are fine
 - no real API keys
 - no personal email domains
 - no private documents
@@ -58,13 +58,13 @@ git push -u origin main
 ## Suggested Repository Description
 
 ```text
-Local-first macOS Meet/Teams recorder: native ScreenCaptureKit dashboard, Python watcher, OpenAI transcription and action-item summaries.
+Local-first macOS Meet/Teams recorder: native ScreenCaptureKit dashboard, Python watcher, Gemini transcription (global or EU-only) and action-item summaries.
 ```
 
 ## Suggested Topics
 
 ```text
-macos screencapturekit openai transcription meetings google-meet microsoft-teams local-first swift python
+macos screencapturekit gemini transcription meetings google-meet microsoft-teams local-first swift python
 ```
 
 ## README Positioning

@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
-"""Pluggable transcription and summarization providers.
+"""Transcription and summarization providers (Google only).
 
-Design goals (v1):
-- A local Whisper (whisper.cpp) transcriber is the always-available floor:
-  no API key, no network at transcription time once the model is cached.
-- API providers are unlocked by setting their key in the environment. They are
-  selected by name in config, with a fallback chain that always ends at local.
-- "Not just ChatGPT": any OpenAI-compatible chat endpoint works by configuration
-  alone (OpenAI, OpenRouter, Groq, Mistral, a local Ollama server, ...). The
-  OpenAI SDK's `base_url` is the single mechanism; no extra dependencies.
+- Google AI Studio (API key): gemini-3.5-transcribe (Interactions API) and gemini-3.5-flash.
+- Gemini Enterprise Agent Platform, EU endpoint only (gcloud ADC): gemini-3.5-flash / 3.8-flash.
+- A local whisper.cpp transcriber is available as an explicit, offline option.
 
-The OpenAI SDK is imported lazily inside provider methods so this module (and
-its unit tests) import cleanly without the package installed.
+Which of these a meeting may use is decided by the location switch (policy.py, D1-D3 in
+docs/PAATOKSET.md). Every outbound model call goes through gemini_http(), which records it in
+the job's call log; nothing here falls back implicitly to a provider that was not named.
 """
 
 from __future__ import annotations
@@ -37,8 +33,9 @@ DEFAULT_WHISPER_MODEL_URL = (
     "ggml-large-v3-turbo-q5_0.bin"
 )
 
-# Google Gemini (AI Studio). Free tier is 0 EUR in exchange for Google using the
-# submitted audio/text to improve its products.
+# Google Gemini (AI Studio). Outside the EEA/CH/UK the unpaid tier lets Google use
+# submitted content to improve its products; for EEA/CH/UK users the paid-service
+# data terms apply to all use (see ai.google.dev/gemini-api/terms).
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash"
@@ -93,12 +90,18 @@ def gemini_http(req: "urllib.request.Request", timeout: int, attempts: int = 6) 
     """
     import urllib.error
 
+    import policy
+
     delay = 8.0
+    url, body = req.full_url, req.data if isinstance(req.data, bytes) else None
     for attempt in range(attempts):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                data = resp.read()
+            policy.record_call(url, body, "ok")
+            return data
         except urllib.error.HTTPError as exc:
+            policy.record_call(url, body, f"HTTP {exc.code}")
             if exc.code == 429:
                 body = ""
                 try:
@@ -119,6 +122,9 @@ def gemini_http(req: "urllib.request.Request", timeout: int, attempts: int = 6) 
                 time.sleep(delay)
                 delay = min(delay * 2, 90.0)
                 continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            policy.record_call(url, body, f"virhe: {type(exc).__name__}")
             raise
 
 
@@ -206,19 +212,42 @@ def gemini_upload_file(api_key: str, path: Path, mime: str) -> str:
     return json.loads(gemini_http(req, timeout=300).decode("utf-8"))["file"]["uri"]
 
 
-def gemini_transcribe_interactions(api_key, file_uri, mime, language_codes, mode) -> str:
-    """Dedicated gemini-3.5-transcribe via the Interactions API."""
+def gemini_mode_payload(mode: Any) -> Any:
+    """Config mode -> API mode. "smart" stays a string, "verbatim" becomes {"type": "verbatim"},
+    a dict (e.g. verbatim + diarization) is passed through unchanged."""
+    if isinstance(mode, dict):
+        return mode
+    if str(mode or "smart").lower() == "verbatim":
+        return {"type": "verbatim"}
+    return "smart"
+
+
+def gemini_interactions_raw(api_key, file_uri, mime, language_codes, mode, custom_vocabulary=None) -> dict:
+    """Call gemini-3.5-transcribe via the Interactions API and return the raw response.
+
+    custom_vocabulary is ignored when the mode asks for diarization or timestamps,
+    because the API does not allow combining them."""
+    mode_payload = gemini_mode_payload(mode)
+    tconf: dict[str, Any] = {"language_codes": list(language_codes or []), "mode": mode_payload}
+    wants_words = isinstance(mode_payload, dict) and (
+        mode_payload.get("diarization_mode") or mode_payload.get("timestamp_granularities")
+    )
+    if custom_vocabulary and not wants_words:
+        tconf["custom_vocabulary"] = list(custom_vocabulary)[:1000]
     body = {
         "model": GEMINI_TRANSCRIBE_MODEL,
         "input": [{"type": "audio", "uri": file_uri, "mime_type": mime}],
-        "generation_config": {"transcription_config": {"language_codes": language_codes, "mode": mode}},
+        "generation_config": {"transcription_config": tconf},
     }
     req = urllib.request.Request(
         f"{GEMINI_BASE}/v1beta/interactions?key={api_key}",
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    data = json.loads(gemini_http(req, timeout=600).decode("utf-8"))
+    return json.loads(gemini_http(req, timeout=900).decode("utf-8"))
+
+
+def gemini_interactions_text(data: dict) -> str:
     parts = [
         content["text"]
         for step in data.get("steps", []) if step.get("type") == "model_output"
@@ -227,7 +256,64 @@ def gemini_transcribe_interactions(api_key, file_uri, mime, language_codes, mode
     return "".join(parts).strip()
 
 
-def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model, temperature: float = 0.0) -> str:
+def gemini_interactions_words(data: dict) -> list:
+    """Word annotations [{text, start, end, speaker}] from a diarized/timestamped response."""
+    words = []
+    for step in data.get("steps", []):
+        if step.get("type") != "model_output":
+            continue
+        for content in step.get("content", []):
+            for ann in content.get("annotations") or []:
+                if ann.get("type") != "word_info":
+                    continue
+
+                def secs(value):
+                    try:
+                        return float(str(value or "0").rstrip("s"))
+                    except ValueError:
+                        return 0.0
+
+                words.append({
+                    "text": ann.get("text", ""),
+                    "start": secs(ann.get("start_offset")),
+                    "end": secs(ann.get("end_offset")),
+                    "speaker": ann.get("speaker") or "spk:?",
+                    "start_index": ann.get("start_index"),
+                    "end_index": ann.get("end_index"),
+                })
+    return words
+
+
+def gemini_transcribe_interactions(api_key, file_uri, mime, language_codes, mode, custom_vocabulary=None) -> str:
+    """Dedicated gemini-3.5-transcribe via the Interactions API."""
+    data = gemini_interactions_raw(api_key, file_uri, mime, language_codes, mode, custom_vocabulary)
+    return gemini_interactions_text(data)
+
+
+def load_vocabulary(config: dict) -> list:
+    """Custom vocabulary from config: inline list + one-term-per-line file (# = comment)."""
+    terms: list = []
+    for term in config.get("gemini_custom_vocabulary") or []:
+        terms.append(str(term).strip())
+    path = config.get("gemini_vocabulary_file")
+    if path:
+        p = Path(str(path)).expanduser()
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    terms.append(line)
+    seen = set()
+    out = []
+    for term in terms:
+        if term and term.casefold() not in seen:
+            seen.add(term.casefold())
+            out.append(term)
+    return out[:1000]
+
+
+def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model, temperature: float = 0.0,
+                               custom_vocabulary=None) -> str:
     """General multimodal model (e.g. gemini-3.5-flash) via generateContent."""
     langs = ", ".join(language_codes) if language_codes else "the spoken language"
     prompt = (
@@ -237,6 +323,11 @@ def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model, t
         "language, and never repeat a passage. If a word is unclear, write [epäselvä] "
         "and continue."
     )
+    if custom_vocabulary:
+        prompt += (
+            " Names and terms that may occur (spell them exactly like this when heard): "
+            + "; ".join(list(custom_vocabulary)[:300]) + "."
+        )
     body = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime, "file_uri": file_uri}}]}],
         # Transcription needs no reasoning; thinking tokens were ~20 % of the bill.
@@ -255,8 +346,14 @@ def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model, t
     return "".join(p.get("text", "") for p in parts).strip()
 
 
-def gemini_generate_text(api_key: str, model: str, prompt: str) -> str:
-    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}
+def gemini_generate_text(api_key: str, model: str, prompt: str, temperature: float = 0.2,
+                         max_output_tokens=None, thinking_budget=None) -> str:
+    gen: dict[str, Any] = {"temperature": temperature}
+    if max_output_tokens:
+        gen["maxOutputTokens"] = int(max_output_tokens)
+    if thinking_budget is not None:
+        gen["thinkingConfig"] = {"thinkingBudget": int(thinking_budget)}
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
     req = urllib.request.Request(
         f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={api_key}",
         data=json.dumps(body).encode("utf-8"),
@@ -268,6 +365,132 @@ def gemini_generate_text(api_key: str, model: str, prompt: str) -> str:
         return ""
     parts = candidates[0].get("content", {}).get("parts", [])
     return "".join(p.get("text", "") for p in parts).strip()
+
+
+# --------------------------------------------------------------------------- #
+# Gemini Enterprise Agent Platform (formerly Vertex AI), EU multi-region endpoint.
+# Auth: gcloud Application Default Credentials (gcloud auth application-default login).
+# --------------------------------------------------------------------------- #
+
+AP_HOSTS = {"eu": "aiplatform.eu.rep.googleapis.com"}  # EU only: see docs/PAATOKSET.md D1
+_AP_TOKEN: dict[str, Any] = {"token": None, "expires": 0.0}
+
+
+def ap_token() -> str:
+    if _AP_TOKEN["token"] and time.time() < _AP_TOKEN["expires"]:
+        return str(_AP_TOKEN["token"])
+    gcloud = shutil.which("gcloud") or "/opt/homebrew/bin/gcloud"
+    result = subprocess.run([gcloud, "auth", "application-default", "print-access-token"],
+                            capture_output=True, text=True)
+    token = result.stdout.strip()
+    if result.returncode != 0 or not token:
+        raise ProviderError("Agent Platform: no ADC token (run: gcloud auth application-default login)")
+    _AP_TOKEN.update(token=token, expires=time.time() + 40 * 60)
+    return token
+
+
+def ap_generate(project: str, location: str, model: str, parts: list, temperature: float = 0.0,
+                max_output_tokens=None, thinking_budget=None, response_schema=None) -> str:
+    """generateContent on Agent Platform; returns the concatenated text of the first candidate."""
+    host = AP_HOSTS.get(location)
+    if not host:
+        raise ProviderError(f"Agent Platform location '{location}' is not allowed (only: {', '.join(AP_HOSTS)})")
+    url = f"https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent"
+    gen: dict[str, Any] = {"temperature": temperature}
+    if max_output_tokens:
+        gen["maxOutputTokens"] = int(max_output_tokens)
+    if thinking_budget is not None:
+        gen["thinkingConfig"] = {"thinkingBudget": int(thinking_budget)}
+    if response_schema:
+        gen["responseMimeType"] = "application/json"
+        gen["responseSchema"] = response_schema
+    body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": gen}
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={
+        "Authorization": f"Bearer {ap_token()}", "Content-Type": "application/json",
+        "x-goog-user-project": project})
+    from urllib.error import HTTPError
+
+    try:
+        data = json.loads(gemini_http(req, timeout=900).decode("utf-8"))
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:400]
+        except Exception:  # noqa: BLE001
+            pass
+        if exc.code == 400 and "thinking budget is not supported" in detail.lower() and thinking_budget is not None:
+            # Some serving paths reject thinkingConfig; retry the same request without it.
+            return ap_generate(project, location, model, parts, temperature, max_output_tokens, None,
+                               response_schema)
+        raise ProviderError(f"Agent Platform HTTP {exc.code}: {detail}") from exc
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return ""
+    return "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", [])).strip()
+
+
+def ap_settings(config: dict) -> tuple:
+    return (str(config.get("agent_platform_project", "")), str(config.get("agent_platform_location", "eu")),
+            str(config.get("agent_platform_text_model", GEMINI_FALLBACK_MODEL)))
+
+
+def text_generator(config: dict):
+    """Callable(prompt, temperature=0.0, max_output_tokens=None, thinking_budget=None) -> str.
+
+    Text steps always try Agent Platform EU first. If it fails and a Gemini API key exists, the call
+    falls back to AI Studio (allowed by D3; the call log lights the red lamp in EU mode)."""
+    project, location, model = ap_settings(config)
+    key = gemini_key(None)
+    studio_model = str(config.get("tarkka_text_model") or config.get("gemini_summary_model") or GEMINI_FALLBACK_MODEL)
+
+    def gen(prompt, temperature=0.0, max_output_tokens=None, thinking_budget=None):
+        if project:
+            try:
+                return ap_generate(project, location, model, [{"text": prompt}], temperature,
+                                   max_output_tokens, thinking_budget)
+            except GeminiSpendCapReached:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if not key:
+                    raise
+                print(f"providers: Agent Platform EU failed ({exc}); using AI Studio", file=sys.stderr)
+        if not key:
+            raise ProviderError("No text backend: neither Agent Platform project nor Gemini API key")
+        return gemini_generate_text(key, studio_model, prompt, temperature, max_output_tokens, thinking_budget)
+    gen.label = f"agent_platform:{location}:{model}" if project else f"gemini_api:{studio_model}"  # type: ignore[attr-defined]
+    return gen
+
+
+# Verbatim transcription prompt for the general model (EU perustaso and Huipputaso F-A share it, so
+# the perustaso result is reused by Huipputaso instead of being paid for twice).
+FLASH_PLAIN_PROMPT_VERSION = "flash_plain_v1"
+
+
+def flash_plain_prompt(vocab: list) -> str:
+    return (
+        "Litteroi tämä suomenkielinen kokousäänite sanatarkasti (verbatim).\n"
+        "- Kirjoita jokainen sana täsmälleen niin kuin se sanotaan, myös puhekieli (mä, sä, et, niinku), "
+        "täytesanat, toistot ja keskenjääneet lauseet. Älä korjaa kielioppia, älä tiivistä, älä selitä.\n"
+        "- Englanninkieliset sanat ja ilmaukset kirjoitetaan englanniksi niin kuin ne sanotaan, ei käännetä.\n"
+        "- Numerot ja päivämäärät numeroina niin kuin puhuja ne sanoo (esim. 4.12., 19. päivä, 50 sivua).\n"
+        "- Jos sana on epäselvä, kirjoita [epäselvä] ja jatka. Älä koskaan arvaa nimeä vapaasti.\n"
+        "- Tulosta vain litteraatti: ei otsikoita, aikaleimoja, puhujamerkintöjä tai kommentteja. "
+        "Älä toista mitään jaksoa.\n"
+        "Nimet ja termit, jotka voivat esiintyä (kirjoita juuri näin, jos kuulet ne): "
+        + ("; ".join(vocab[:300]) or "-")
+    )
+
+
+def to_mp3(ffmpeg: str, snippet: Path) -> Path:
+    out_dir = snippet.parent / "flash-mp3"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mp3 = out_dir / f"{snippet.stem}.mp3"
+    if not mp3.exists():
+        r = subprocess.run([ffmpeg, "-hide_banner", "-y", "-i", str(snippet), "-ac", "1", "-ar", "16000",
+                            "-c:a", "libmp3lame", "-b:a", "48k", str(mp3)], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ProviderError(r.stderr.strip() or "ffmpeg mp3 conversion failed")
+    return mp3
 
 
 # --------------------------------------------------------------------------- #
@@ -289,46 +512,6 @@ class Transcriber:
 
     def transcribe(self, snippet: Path) -> tuple[str, Any]:
         raise NotImplementedError
-
-
-class OpenAIAudioTranscriber(Transcriber):
-    """OpenAI-compatible /audio/transcriptions (OpenAI, Groq, ...)."""
-
-    def __init__(self, name, base_url, key_env, model, diarize_model=None,
-                 diarize=False, max_parallel=3):
-        self.name = name
-        self.base_url = base_url
-        self.key_env = key_env or "OPENAI_API_KEY"
-        self.supports_diarization = bool(diarize_model)
-        self.diarize = bool(diarize and diarize_model)
-        self.model = diarize_model if self.diarize else model
-        self.model_label = self.model
-        self.response_format = "diarized_json" if self.diarize else "json"
-        self.max_parallel = max_parallel
-
-    def available(self) -> bool:
-        return bool(os.environ.get(self.key_env))
-
-    def _client(self):
-        from openai import OpenAI
-
-        key = os.environ.get(self.key_env)
-        if not key:
-            raise ProviderError(f"{self.key_env} is not set for provider '{self.name}'")
-        kwargs: dict[str, Any] = {"api_key": key}
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
-        return OpenAI(**kwargs)
-
-    def transcribe(self, snippet: Path) -> tuple[str, Any]:
-        client = self._client()
-        with snippet.open("rb") as audio_file:
-            result = client.audio.transcriptions.create(
-                file=audio_file,
-                model=self.model,
-                response_format=self.response_format,
-            )
-        return _result_text(result), _result_jsonable(result)
 
 
 class WhisperCppTranscriber(Transcriber):
@@ -447,12 +630,14 @@ class GeminiTranscriber(Transcriber):
     max_parallel = 2  # keep the free-tier transcribe rate limit happy
 
     def __init__(self, name, model=None, fallback_model=GEMINI_FALLBACK_MODEL,
-                 mode="smart", language_codes=None, key_env=None, ffmpeg="ffmpeg"):
+                 mode="smart", language_codes=None, key_env=None, ffmpeg="ffmpeg",
+                 custom_vocabulary=None):
         self.name = name
         self.model = model or GEMINI_TRANSCRIBE_MODEL
         self.fallback_model = fallback_model or ""
         self.mode = mode or "smart"
         self.language_codes = language_codes or ["fi-FI"]
+        self.custom_vocabulary = list(custom_vocabulary or [])
         self.key_env = key_env
         self.ffmpeg = ffmpeg
         self.model_label = self.model
@@ -477,10 +662,12 @@ class GeminiTranscriber(Transcriber):
 
     def _run(self, api_key: str, file_uri: str, model: str, retry: bool = False) -> str:
         if model == GEMINI_TRANSCRIBE_MODEL:
-            return gemini_transcribe_interactions(api_key, file_uri, "audio/flac", self.language_codes, self.mode)
+            return gemini_transcribe_interactions(api_key, file_uri, "audio/flac", self.language_codes, self.mode,
+                                                  self.custom_vocabulary)
         # A second try at a slightly higher temperature escapes a deterministic loop.
         return gemini_transcribe_generate(api_key, file_uri, "audio/flac", self.language_codes, model,
-                                          temperature=0.3 if retry else 0.0)
+                                          temperature=0.3 if retry else 0.0,
+                                          custom_vocabulary=self.custom_vocabulary)
 
     def transcribe(self, snippet: Path) -> tuple[str, Any]:
         api_key = gemini_key(self.key_env)
@@ -536,7 +723,67 @@ class GeminiTranscriber(Transcriber):
             text, used = UNRELIABLE_MARKER, "unreliable"
         elif not text:
             print(f"providers: Gemini produced no usable transcript for {snippet.name}", file=sys.stderr)
-        return text, {"text": text, "model": used, "engine": f"gemini:{used}"}
+        return text, {"text": text, "model": used, "engine": f"gemini:{used}",
+                      "mode": str(self.mode), "vocabulary": bool(self.custom_vocabulary)}
+
+
+class AgentPlatformTranscriber(Transcriber):
+    """EU perustaso: one verbatim pass with the general model on Agent Platform EU.
+
+    Same prompt and settings as Huipputaso pass F-A, so Huipputaso reuses this result. If the EU
+    service fails for a snippet and `fallback` is set, that snippet is transcribed by the fallback
+    (AI Studio); D3 allows this and the call log lights the red lamp."""
+
+    max_parallel = 3
+
+    def __init__(self, name, project, location="eu", model=GEMINI_FALLBACK_MODEL, ffmpeg="ffmpeg",
+                 custom_vocabulary=None, fallback: "Transcriber | None" = None):
+        self.name = name
+        self.project = project
+        self.location = location
+        self.model = model or GEMINI_FALLBACK_MODEL
+        self.ffmpeg = ffmpeg
+        self.custom_vocabulary = list(custom_vocabulary or [])
+        self.fallback = fallback
+        self.model_label = f"agent_platform:{location}:{self.model}"
+
+    def available(self) -> bool:
+        return bool(self.project) and bool(shutil.which("gcloud") or Path("/opt/homebrew/bin/gcloud").exists())
+
+    def transcribe(self, snippet: Path) -> tuple[str, Any]:
+        import base64
+
+        mp3 = to_mp3(self.ffmpeg, snippet)
+        part = {"inlineData": {"mimeType": "audio/mpeg", "data": base64.b64encode(mp3.read_bytes()).decode("ascii")}}
+        prompt = flash_plain_prompt(self.custom_vocabulary)
+        last_error: Exception | None = None
+        unreliable = False
+        for attempt, temperature in enumerate((0.0, 0.0, 0.3)):
+            if attempt:
+                time.sleep(10 * attempt)
+            try:
+                text = ap_generate(self.project, self.location, self.model, [{"text": prompt}, part],
+                                   temperature=temperature, max_output_tokens=65536, thinking_budget=1024)
+            except GeminiSpendCapReached:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                print(f"providers: EU transcription attempt {attempt + 1} failed for {snippet.name}: {exc}",
+                      file=sys.stderr)
+                continue
+            if text and gemini_looks_degenerate(text):
+                unreliable = True
+                continue
+            return text, {"text": text, "model": self.model_label, "engine": self.model_label,
+                          "prompt": FLASH_PLAIN_PROMPT_VERSION}
+        if self.fallback is not None and self.fallback.available():
+            print(f"providers: EU service failed for {snippet.name}; using {self.fallback.name}", file=sys.stderr)
+            text, raw = self.fallback.transcribe(snippet)
+            raw = dict(raw if isinstance(raw, dict) else {}, eu_fallback=True)
+            return text, raw
+        if last_error is not None and not unreliable:
+            raise ProviderError(f"Agent Platform EU could not transcribe {snippet.name}: {last_error}")
+        return UNRELIABLE_MARKER, {"text": UNRELIABLE_MARKER, "model": "unreliable", "engine": self.model_label}
 
 
 # --------------------------------------------------------------------------- #
@@ -554,50 +801,21 @@ class Summarizer:
         raise NotImplementedError
 
 
-class OpenAIChatSummarizer(Summarizer):
-    """Any OpenAI-compatible /chat/completions endpoint.
+class AgentPlatformSummarizer(Summarizer):
+    """Gemini via Agent Platform (EU endpoint by default), authenticated with gcloud ADC."""
 
-    Works for OpenAI, OpenRouter (-> Claude/Gemini/Llama/...), Groq, Mistral,
-    and a local Ollama server, selected purely by base_url + model in config.
-    """
-
-    def __init__(self, name, base_url, key_env, model, extra_headers=None):
+    def __init__(self, name, project, location="eu", model=GEMINI_FALLBACK_MODEL):
         self.name = name
-        self.base_url = base_url
-        self.key_env = key_env  # may be None for a keyless local server
-        self.model = model
-        self.model_label = model
-        self.extra_headers = extra_headers or {}
+        self.project = project
+        self.location = location
+        self.model = model or GEMINI_FALLBACK_MODEL
+        self.model_label = f"agent_platform:{location}:{self.model}"
 
     def available(self) -> bool:
-        if not self.key_env:
-            return True  # keyless (e.g. local Ollama)
-        return bool(os.environ.get(self.key_env))
-
-    def _client(self):
-        from openai import OpenAI
-
-        kwargs: dict[str, Any] = {}
-        if self.key_env:
-            key = os.environ.get(self.key_env)
-            if not key:
-                raise ProviderError(f"{self.key_env} is not set for provider '{self.name}'")
-            kwargs["api_key"] = key
-        else:
-            kwargs["api_key"] = os.environ.get("OPENAI_API_KEY", "not-needed")
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
-        if self.extra_headers:
-            kwargs["default_headers"] = self.extra_headers
-        return OpenAI(**kwargs)
+        return bool(self.project) and bool(shutil.which("gcloud") or Path("/opt/homebrew/bin/gcloud").exists())
 
     def summarize(self, prompt: str) -> str:
-        client = self._client()
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return (response.choices[0].message.content or "").strip()
+        return ap_generate(self.project, self.location, self.model, [{"text": prompt}], temperature=0.2)
 
 
 class GeminiSummarizer(Summarizer):
@@ -626,8 +844,7 @@ class GeminiSummarizer(Summarizer):
 def default_providers(config: dict[str, Any]) -> dict[str, Any]:
     """Synthesized registry used when config has no explicit `providers` block.
 
-    Keeps legacy configs (no providers block) working: OpenAI for both stages
-    using the old top-level model keys, plus a local Whisper option.
+    Google only (OpenAI was removed, docs/PAATOKSET.md D3), plus a local Whisper option.
     """
     return {
         "local_whisper": {
@@ -636,19 +853,6 @@ def default_providers(config: dict[str, Any]) -> dict[str, Any]:
                 "model": config.get("whisper_model", DEFAULT_WHISPER_MODEL),
                 "model_url": config.get("whisper_model_url", DEFAULT_WHISPER_MODEL_URL),
             }
-        },
-        "openai": {
-            "base_url": "https://api.openai.com/v1",
-            "key_env": "OPENAI_API_KEY",
-            "transcribe": {
-                "type": "openai_audio",
-                "model": config.get("transcribe_model", "gpt-4o-mini-transcribe"),
-                "diarize_model": config.get("diarize_model", "gpt-4o-transcribe-diarize"),
-            },
-            "summarize": {
-                "type": "openai_chat",
-                "model": config.get("summary_model", "gpt-4o-mini"),
-            },
         },
         "gemini": {
             "key_env": "GEMINI_API_KEY",
@@ -690,16 +894,6 @@ def build_transcribers(config: dict[str, Any]) -> dict[str, Transcriber]:
                 threads=block.get("threads"),
                 auto_download=config.get("whisper_auto_download", True),
             )
-        elif kind == "openai_audio":
-            out[name] = OpenAIAudioTranscriber(
-                name=name,
-                base_url=spec.get("base_url"),
-                key_env=spec.get("key_env", "OPENAI_API_KEY"),
-                model=block.get("model", "gpt-4o-mini-transcribe"),
-                diarize_model=block.get("diarize_model"),
-                diarize=diarize,
-                max_parallel=max_parallel,
-            )
         elif kind == "gemini":
             model = block.get("model", GEMINI_TRANSCRIBE_MODEL)
             fallback_model = block.get("fallback_model", GEMINI_FALLBACK_MODEL)
@@ -714,6 +908,7 @@ def build_transcribers(config: dict[str, Any]) -> dict[str, Transcriber]:
                 language_codes=block.get("language_codes", ["fi-FI"]),
                 key_env=spec.get("key_env"),
                 ffmpeg=ffmpeg_path(config),
+                custom_vocabulary=load_vocabulary(config),
             )
     return out
 
@@ -725,15 +920,7 @@ def build_summarizers(config: dict[str, Any]) -> dict[str, Summarizer]:
         block = (spec or {}).get("summarize")
         if not block:
             continue
-        if block.get("type") == "openai_chat":
-            out[name] = OpenAIChatSummarizer(
-                name=name,
-                base_url=spec.get("base_url"),
-                key_env=spec.get("key_env"),
-                model=block.get("model", "gpt-4o-mini"),
-                extra_headers=spec.get("extra_headers"),
-            )
-        elif block.get("type") == "gemini":
+        if block.get("type") == "gemini":
             model = block.get("model", GEMINI_FALLBACK_MODEL)
             if name == "gemini":
                 model = config.get("gemini_summary_model", model)
@@ -742,17 +929,20 @@ def build_summarizers(config: dict[str, Any]) -> dict[str, Summarizer]:
                 model=model,
                 key_env=spec.get("key_env"),
             )
+    if config.get("agent_platform_project"):
+        project, location, model = ap_settings(config)
+        out["agent_platform"] = AgentPlatformSummarizer("agent_platform", project, location, model)
     return out
 
 
 def select(providers_map: dict[str, Any], primary: str | None, fallback: list[str] | None):
-    """Return the first available provider in [primary, *fallback, *rest], else None."""
+    """Return the first available provider in [primary, *fallback], else None.
+
+    Only the providers named here are ever used; there is no implicit "any other available"
+    fallback (it used to pick up OpenAI whenever its key happened to be set)."""
     order: list[str] = []
     for name in [primary, *(fallback or [])]:
         if name and name not in order:
-            order.append(name)
-    for name in providers_map:
-        if name not in order:
             order.append(name)
     for name in order:
         provider = providers_map.get(name)

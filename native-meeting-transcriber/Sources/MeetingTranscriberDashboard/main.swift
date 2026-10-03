@@ -17,6 +17,48 @@ private let suppressionURL = runtimeRoot.appendingPathComponent("auto-suppressio
 private let configURL = appRoot.appendingPathComponent("config.json")
 private let envURL = home.appendingPathComponent(".meeting-transcriber.env")
 private let transcribePython = runtimeRoot.appendingPathComponent("venv/bin/python")
+// Kytkimet ja punainen lamppu (docs/PAATOKSET.md D1-D4); sama muoto kuin meeting-transcriber/policy.py.
+private let switchURL = runtimeRoot.appendingPathComponent("kytkimet.json")
+private let lampURL = runtimeRoot.appendingPathComponent("lamppu.json")
+let sijaintiGlobal = "maailmanlaajuinen"
+let sijaintiEU = "eu"
+let laatuPerus = "perus"
+let laatuHuippu = "huippu"
+
+/// Read switch positions; anything unknown falls back to the defaults (global, perustaso).
+func readSwitches(from url: URL) -> (sijainti: String, laatu: String) {
+    guard let data = try? Data(contentsOf: url),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return (sijaintiGlobal, laatuPerus)
+    }
+    let s = (object["sijainti"] as? String)?.lowercased() == sijaintiEU ? sijaintiEU : sijaintiGlobal
+    let l = (object["laatu"] as? String)?.lowercased() == laatuHuippu ? laatuHuippu : laatuPerus
+    return (s, l)
+}
+
+/// Lock the switch positions into the meeting folder (job.json). Stricter wins: EU and Huipputaso
+/// stay once set, a later switch change can only tighten a meeting.
+func lockJob(_ jobDir: URL, sijainti: String, laatu: String, moment: String) {
+    let url = jobDir.appendingPathComponent("job.json")
+    var job: [String: Any] = [:]
+    if let data = try? Data(contentsOf: url),
+       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        job = object
+    }
+    let now = ISO8601DateFormatter().string(from: Date())
+    let hadJob = !job.isEmpty
+    let oldS = job["sijainti"] as? String
+    let oldL = job["laatu"] as? String
+    job["sijainti"] = (sijainti == sijaintiEU || (hadJob && oldS == sijaintiEU)) ? sijaintiEU : sijaintiGlobal
+    job["laatu"] = (laatu == laatuHuippu || (hadJob && oldL == laatuHuippu)) ? laatuHuippu : laatuPerus
+    var history = job["historia"] as? [[String: Any]] ?? []
+    history.append(["hetki": moment, "aika": now, "sijainti": sijainti, "laatu": laatu])
+    job["historia"] = history
+    if job["luotu"] == nil { job["luotu"] = now }
+    if let data = try? JSONSerialization.data(withJSONObject: job, options: [.prettyPrinted, .sortedKeys]) {
+        try? data.write(to: url, options: .atomic)
+    }
+}
 let statusStaleSeconds: TimeInterval = 10
 
 struct RecorderStatus: Decodable {
@@ -50,6 +92,18 @@ enum RecordingState: Equatable {
     }
 }
 
+/// ISO 8601 with or without fractional seconds (the watcher writes microseconds).
+func parseISODate(_ value: String) -> Date? {
+    let plain = ISO8601DateFormatter()
+    if let date = plain.date(from: value) { return date }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) { return date }
+    // Microsecond precision (Python isoformat) is not always accepted: drop the fraction.
+    let trimmed = value.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+    return plain.date(from: trimmed)
+}
+
 func statusIsFresh(_ status: RecorderStatus, now: Date = Date(), threshold: TimeInterval = statusStaleSeconds) -> Bool {
     guard let updatedAt = ISO8601DateFormatter().date(from: status.updatedAt) else { return false }
     return now.timeIntervalSince(updatedAt) <= threshold
@@ -74,6 +128,9 @@ struct RecordingItem: Identifiable {
     let transcriptURL: URL?
     let summaryURL: URL?
     let modifiedAt: Date
+    var state: String = ""  // "", "virhe", "yhteenveto puuttuu", "Huipputaso jonossa", ...
+    var locationEU: Bool = false
+    var outsideEU: Bool = false
 
     var name: String { folderURL.lastPathComponent }
     var transcriptName: String { transcriptURL?.lastPathComponent ?? "None" }
@@ -328,8 +385,10 @@ final class DashboardModel: ObservableObject {
     @Published var microphoneLevel = 0.0
     @Published var currentOutput = ""
     @Published var transcriptFormat = "md"
-    @Published var transcribeModel = "gemini-3.5-transcribe"
-    @Published var summaryModel = "gemini-3.5-flash"
+    @Published private(set) var sijainti = sijaintiGlobal
+    @Published private(set) var laatu = laatuPerus
+    @Published private(set) var lampRed = false
+    @Published private(set) var lampText = ""
     @Published var summaryEnabled = true
     @Published var transcriptionProgress = 0.0
     @Published var transcriptionMessage = ""
@@ -344,17 +403,6 @@ final class DashboardModel: ObservableObject {
     private var activeAutoOutputURL: URL?
     private var lastAutoCommandKey = ""
     private var timer: Timer?
-    // Google Gemini models (0 EUR on the AI Studio free tier). gemini-3.5-transcribe
-    // is the dedicated ASR model; gemini-3.5-flash is the robust general fallback.
-    private let transcribeModels = [
-        "gemini-3.5-transcribe",
-        "gemini-3.5-flash"
-    ]
-    private let summaryModels = [
-        "gemini-3.5-flash",
-        "gemini-2.5-flash",
-        "gemini-3.5-flash-lite"
-    ]
 
     var isRecording: Bool { recordingState.isRecording }
 
@@ -394,6 +442,9 @@ final class DashboardModel: ObservableObject {
 
     init() {
         loadConfig()
+        // A command file left over from before this launch must never be replayed: on 3.10.2026 a
+        // relaunch re-ran yesterday's "start" and recorded over that meeting's recording.
+        lastAutoCommandKey = currentCommandKey() ?? ""
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -405,8 +456,60 @@ final class DashboardModel: ObservableObject {
 
     func refresh() {
         autoSuppressed = FileManager.default.fileExists(atPath: suppressionURL.path)
+        let sw = readSwitches(from: switchURL)
+        if sw.sijainti != sijainti { sijainti = sw.sijainti }
+        if sw.laatu != laatu { laatu = sw.laatu }
+        readLamp()
         readStatus()
         readFiles()
+    }
+
+    var isEU: Bool { sijainti == sijaintiEU }
+    var isHuippu: Bool { laatu == laatuHuippu }
+
+    func setSijainti(_ value: String) { writeSwitches(sijainti: value, laatu: laatu) }
+    func setLaatu(_ value: String) { writeSwitches(sijainti: sijainti, laatu: value) }
+
+    private func writeSwitches(sijainti s: String, laatu l: String) {
+        do {
+            try writeJSON(["sijainti": s, "laatu": l], to: switchURL)
+            sijainti = s
+            laatu = l
+            message = s == sijaintiEU ? "Käsittelysijainti: EU" : "Käsittelysijainti: maailmanlaajuinen"
+        } catch {
+            message = "Kytkintä ei voitu tallentaa: \(error.localizedDescription)"
+        }
+    }
+
+    private func readLamp() {
+        guard let data = try? Data(contentsOf: lampURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            lampRed = false
+            lampText = ""
+            return
+        }
+        let violations = object["rikkeet"] as? [[String: Any]] ?? []
+        let login = object["eu_kirjautuminen"] as? [String: Any]
+        let loginOK = (login?["ok"] as? Bool) ?? true
+        if !violations.isEmpty {
+            let names = violations.compactMap { $0["palaveri"] as? String }.joined(separator: ", ")
+            lampRed = true
+            lampText = "EU-asennossa käsiteltyä EU:n ulkopuolella: \(names)"
+        } else if isEU && !loginOK {
+            lampRed = true
+            lampText = "EU-kirjautuminen ei toimi (gcloud auth application-default login)"
+        } else {
+            lampRed = false
+            lampText = loginOK ? "" : "EU-kirjautuminen ei toimi"
+        }
+    }
+
+    func acknowledgeLamp() {
+        guard let data = try? Data(contentsOf: lampURL),
+              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        object["rikkeet"] = []
+        try? writeJSON(object, to: lampURL)
+        readLamp()
     }
 
     func startManualRecording() {
@@ -418,6 +521,8 @@ final class DashboardModel: ObservableObject {
             let jobDir = outputRoot.appendingPathComponent("\(formatter.string(from: Date()))-manual")
             try FileManager.default.createDirectory(at: jobDir, withIntermediateDirectories: true)
             let outputURL = jobDir.appendingPathComponent("recording.mp4")
+            let sw = readSwitches(from: switchURL)
+            lockJob(jobDir, sijainti: sw.sijainti, laatu: sw.laatu, moment: "nauhoitus")
 
             let recorder = DashboardRecorder()
             manualRecorder = recorder
@@ -494,6 +599,14 @@ final class DashboardModel: ObservableObject {
         message = "Automatic recording resumed"
     }
 
+    private func currentCommandKey() -> String? {
+        guard let data = try? Data(contentsOf: commandURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let command = object["command"] as? String,
+              let id = object["id"] as? String else { return nil }
+        return "\(command):\(id):\(object["createdAt"] as? String ?? "")"
+    }
+
     private func handleAutoCommand() {
         guard let data = try? Data(contentsOf: commandURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -514,6 +627,16 @@ final class DashboardModel: ObservableObject {
                 message = "Automatic recording command was missing output path"
                 return
             }
+            if let created = object["createdAt"] as? String, let date = parseISODate(created),
+               Date().timeIntervalSince(date) > 120 {
+                message = "Ignored a stale automatic recording command (\(id))"
+                return
+            }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: outputPath)
+            if let size = attrs?[.size] as? NSNumber, size.intValue > 0 {
+                message = "Refused to record over an existing recording (\(id))"
+                return
+            }
             startAutoRecording(
                 outputURL: URL(fileURLWithPath: outputPath),
                 detail: object["detail"] as? String,
@@ -526,6 +649,9 @@ final class DashboardModel: ObservableObject {
     }
 
     private func startAutoRecording(outputURL: URL, detail: String?, commandID: String) {
+        let sw = readSwitches(from: switchURL)
+        try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        lockJob(outputURL.deletingLastPathComponent(), sijainti: sw.sijainti, laatu: sw.laatu, moment: "nauhoitus")
         let recorder = DashboardRecorder()
         autoRecorder = recorder
         activeAutoCommandID = commandID
@@ -650,19 +776,6 @@ final class DashboardModel: ObservableObject {
         updateConfig(key: "transcribe_output_format", value: value)
     }
 
-    func setTranscribeModel(_ value: String) {
-        transcribeModel = value
-        // Drive the Gemini provider and make sure it is the selected one.
-        updateConfig(key: "gemini_transcribe_model", value: value)
-        updateConfig(key: "transcribe_provider", value: "gemini")
-    }
-
-    func setSummaryModel(_ value: String) {
-        summaryModel = value
-        updateConfig(key: "gemini_summary_model", value: value)
-        updateConfig(key: "summary_provider", value: "gemini")
-    }
-
     func setSummaryEnabled(_ value: Bool) {
         summaryEnabled = value
         updateConfig(key: "summary", value: value ? "on" : "off")
@@ -736,12 +849,40 @@ final class DashboardModel: ObservableObject {
                 .map { folder.appendingPathComponent($0) }
                 .first { FileManager.default.fileExists(atPath: $0.path) }
             let summary = folder.appendingPathComponent("summary.md")
+            func stage(_ name: String) -> String? {
+                guard let data = try? Data(contentsOf: folder.appendingPathComponent(name)),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                return object["stage"] as? String
+            }
+            var state = ""
+            switch stage("progress.json") {
+            case "error": state = "litterointi odottaa uusintaa"
+            case "summary_error": state = "yhteenveto odottaa uusintaa"
+            default: break
+            }
+            if state.isEmpty, FileManager.default.fileExists(atPath: folder.appendingPathComponent("huipputaso-jono.json").path) {
+                state = stage("progress-huipputaso.json") == "error" ? "Huipputaso odottaa uusintaa" : "Huipputaso jonossa"
+            }
+            var locationEU = false
+            if let data = try? Data(contentsOf: folder.appendingPathComponent("job.json")),
+               let job = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                locationEU = (job["sijainti"] as? String) == sijaintiEU
+            }
+            var outsideEU = false
+            if locationEU, let log = try? String(contentsOf: folder.appendingPathComponent("kutsut.jsonl"), encoding: .utf8) {
+                outsideEU = log.split(separator: "\n").contains { line in
+                    line.contains("\"host\"") && !line.contains("aiplatform.eu.rep.googleapis.com")
+                }
+            }
             return RecordingItem(
                 folderURL: folder,
                 url: recording,
                 transcriptURL: transcript,
                 summaryURL: FileManager.default.fileExists(atPath: summary.path) ? summary : nil,
-                modifiedAt: modifiedAt
+                modifiedAt: modifiedAt,
+                state: state,
+                locationEU: locationEU,
+                outsideEU: outsideEU
             )
         }
         .sorted { $0.modifiedAt > $1.modifiedAt }
@@ -757,8 +898,6 @@ final class DashboardModel: ObservableObject {
             return
         }
         transcriptFormat = (object["transcribe_output_format"] as? String) ?? "md"
-        transcribeModel = (object["gemini_transcribe_model"] as? String) ?? "gemini-3.5-transcribe"
-        summaryModel = (object["gemini_summary_model"] as? String) ?? "gemini-3.5-flash"
         summaryEnabled = ((object["summary"] as? String) ?? "on") != "off"
     }
 
@@ -796,9 +935,8 @@ final class DashboardModel: ObservableObject {
             "--recording", url.path,
             "--config", configURL.path,
         ]
-        // Forward every key from the env file so any configured provider works
-        // (OpenAI, OpenRouter, ...). Local Whisper needs no key at all, so we do
-        // not block transcription when no key is present.
+        // Forward the keys from the env file (Gemini API key for the global position; the EU
+        // service uses gcloud login). The worker reads the switches itself.
         process.environment = ProcessInfo.processInfo.environment.merging(loadEnv()) { _, new in new }
         process.terminationHandler = { [weak self] finished in
             Task { @MainActor in
@@ -848,7 +986,12 @@ final class DashboardModel: ObservableObject {
         } else {
             return
         }
-        let progressURL = folder.appendingPathComponent("progress.json")
+        var progressURL = folder.appendingPathComponent("progress.json")
+        let upgradeURL = folder.appendingPathComponent("progress-huipputaso.json")
+        func mtime(_ u: URL) -> Date {
+            ((try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate) ?? .distantPast
+        }
+        if mtime(upgradeURL) > mtime(progressURL) { progressURL = upgradeURL }
         guard let data = try? Data(contentsOf: progressURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
@@ -857,8 +1000,6 @@ final class DashboardModel: ObservableObject {
         transcriptionMessage = object["message"] as? String ?? transcriptionMessage
     }
 
-    func transcribeModelOptions() -> [String] { transcribeModels }
-    func summaryModelOptions() -> [String] { summaryModels }
 }
 
 struct LevelBar: View {
@@ -901,6 +1042,10 @@ struct DashboardView: View {
             }
             .padding()
 
+            SwitchPanel(model: model)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+
             VStack(alignment: .leading, spacing: 8) {
                 Text(model.message)
                     .font(.subheadline)
@@ -942,28 +1087,6 @@ struct DashboardView: View {
                         model.resumeAutomaticRecording()
                     }
                 }
-                HStack {
-                    Text("Transcribe")
-                        .frame(width: 72, alignment: .leading)
-                    Picker("", selection: Binding(
-                        get: { model.transcribeModel },
-                        set: { model.setTranscribeModel($0) }
-                    )) {
-                        ForEach(model.transcribeModelOptions(), id: \.self) { Text($0).tag($0) }
-                    }
-                    .labelsHidden()
-                }
-                HStack {
-                    Text("Summary")
-                        .frame(width: 72, alignment: .leading)
-                    Picker("", selection: Binding(
-                        get: { model.summaryModel },
-                        set: { model.setSummaryModel($0) }
-                    )) {
-                        ForEach(model.summaryModelOptions(), id: \.self) { Text($0).tag($0) }
-                    }
-                    .labelsHidden()
-                }
                 if !model.transcriptionMessage.isEmpty {
                     HStack {
                         Text("Progress")
@@ -989,7 +1112,80 @@ struct DashboardView: View {
                 }
             }
         }
-        .frame(minWidth: 640, minHeight: 480)
+        .frame(minWidth: 640, minHeight: 560)
+    }
+}
+
+/// The two switches (D1, D2) and the red lamp (D4), shown so they cannot be missed.
+struct SwitchPanel: View {
+    @ObservedObject var model: DashboardModel
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                Text(model.isEU ? "🇪🇺  EU" : "🌍  MAAILMANLAAJUINEN")
+                    .font(.title2.bold())
+                    .foregroundStyle(.white)
+                Spacer()
+                Picker("Käsittelysijainti", selection: Binding(
+                    get: { model.sijainti },
+                    set: { model.setSijainti($0) }
+                )) {
+                    Text("🌍 Maailmanlaajuinen").tag(sijaintiGlobal)
+                    Text("🇪🇺 EU").tag(sijaintiEU)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 280)
+            }
+            .padding(12)
+            .background(model.isEU ? Color(red: 0.0, green: 0.55, blue: 0.3) : Color(red: 0.1, green: 0.35, blue: 0.85))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .help(model.isEU
+                  ? "Ääni ja teksti käsitellään vain Googlen EU-palvelussa. Jos EU ei vastaa, käsittely voi jatkua muualla ja punainen lamppu syttyy."
+                  : "Paras laatu: ääni käsitellään Google AI Studiossa (ei rajattu EU:hun).")
+
+            HStack(spacing: 12) {
+                Text(model.isHuippu ? "★  HUIPPUTASO" : "PERUSTASO")
+                    .font(.title3.bold())
+                    .foregroundStyle(.white)
+                Spacer()
+                Picker("Laatu", selection: Binding(
+                    get: { model.laatu },
+                    set: { model.setLaatu($0) }
+                )) {
+                    Text("Perustaso").tag(laatuPerus)
+                    Text("★ Huipputaso").tag(laatuHuippu)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 280)
+            }
+            .padding(10)
+            .background(model.isHuippu ? Color(red: 0.55, green: 0.25, blue: 0.75) : Color.gray)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .help(model.isHuippu
+                  ? "Nopea versio heti, Huipputaso korvaa sen taustalla (kaksi ajoa + vertaava malli)."
+                  : "Yksi litterointiajo.")
+
+            if model.lampRed {
+                HStack(spacing: 10) {
+                    Circle().fill(Color.red).frame(width: 16, height: 16)
+                        .shadow(color: .red, radius: 6)
+                    Text(model.lampText)
+                        .font(.callout.bold())
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                    Spacer()
+                    Button("Kuittaa") { model.acknowledgeLamp() }
+                }
+                .padding(10)
+                .background(Color.red.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            } else if !model.lampText.isEmpty {
+                Text(model.lampText).font(.caption).foregroundStyle(.orange)
+            }
+        }
     }
 }
 
@@ -1007,8 +1203,19 @@ struct FileRow: View {
                     .font(.caption)
                     .foregroundColor(item.transcriptURL == nil ? Color.secondary : Color.green)
                     .lineLimit(1)
+                if !item.state.isEmpty {
+                    Text(item.state)
+                        .font(.caption.bold())
+                        .foregroundColor(item.state.contains("jonossa") ? .purple : .red)
+                }
             }
             Spacer()
+            if item.outsideEU {
+                Circle().fill(Color.red).frame(width: 10, height: 10).help("EU-palaveri käsiteltiin osin EU:n ulkopuolella")
+            }
+            if item.locationEU {
+                Text("EU").font(.caption.bold()).foregroundStyle(.green)
+            }
             Button("Show") { model.reveal(item) }
         }
         .padding(.horizontal)
@@ -1030,6 +1237,15 @@ struct HUDView: View {
                 .frame(width: 34, alignment: .leading)
             LevelBar(value: model.level, color: model.isRecording ? .red : .gray)
                 .frame(width: 76)
+            Text(model.isEU ? "🇪🇺 EU" : "🌍")
+                .font(.caption.bold())
+                .foregroundStyle(model.isEU ? Color.green : Color.blue)
+            if model.isHuippu {
+                Text("★").font(.caption.bold()).foregroundStyle(.purple)
+            }
+            if model.lampRed {
+                Circle().fill(Color.red).frame(width: 8, height: 8).help(model.lampText)
+            }
             if model.canStopRecording {
                 Button {
                     model.stopRecording()
@@ -1066,7 +1282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func createHUD() {
         let view = HUDView(model: model)
         let window = NSWindow(
-            contentRect: NSRect(x: 40, y: 40, width: 180, height: 38),
+            contentRect: NSRect(x: 40, y: 40, width: 250, height: 38),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false

@@ -61,4 +61,11 @@ final class RecordingStatusTests: XCTestCase {
             status: malformed
         ))
     }
+
+    func testParsesWatcherTimestampsForStaleCommandCheck() {
+        // The watcher writes Python isoformat with microseconds; a stale start command must be detectable.
+        XCTAssertNotNil(parseISODate("2026-10-02T08:01:49.096576+00:00"))
+        XCTAssertNotNil(parseISODate("2026-10-02T08:01:49Z"))
+        XCTAssertNil(parseISODate("not a date"))
+    }
 }

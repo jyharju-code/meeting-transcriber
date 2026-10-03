@@ -7,3 +7,12 @@ config.json
 .build/
 __pycache__/
 *.pyc
+sanasto.txt
+*.env
+.env
+kytkimet.json
+lamppu.json
+kutsut.jsonl
+job.json
+*.flac
+*.mp3

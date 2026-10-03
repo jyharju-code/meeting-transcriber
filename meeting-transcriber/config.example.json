@@ -29,7 +29,12 @@
   "dashboard_ack_file": "~/.meeting-transcriber/dashboard-ack.json",
   "auto_suppression_file": "~/.meeting-transcriber/auto-suppression.json",
   "dashboard_app_path": "/Applications/Meeting Transcriber Dashboard.app",
-  "teams_ignored_titles": ["liity keskusteluun", "join the conversation", "join now", "pre-join"],
+  "teams_ignored_titles": [
+    "liity keskusteluun",
+    "join the conversation",
+    "join now",
+    "pre-join"
+  ],
   "record_command": [
     "/Applications/Native Meeting Recorder.app/Contents/MacOS/native-meeting-recorder",
     "--output",
@@ -45,42 +50,9 @@
   "transcribe_python": "~/.meeting-transcriber/venv/bin/python",
   "transcription_worker": "~/.meeting-transcriber/app/transcribe_recording.py",
   "transcribe_output_format": "md",
-
-  "_comment_providers": "Local Whisper is the always-available floor. API providers unlock by setting their key env var. transcribe_provider/summary_provider pick the primary; *_fallback lists are tried in order, then any other available provider, ending at the local floor.",
-  "transcribe_provider": "local_whisper",
-  "transcribe_fallback": ["openai"],
-  "summary_provider": "openai",
-  "summary_fallback": ["openrouter"],
   "models_dir": "~/.meeting-transcriber/models",
   "whisper_auto_download": true,
   "whisper_language": "auto",
-  "providers": {
-    "local_whisper": {
-      "transcribe": {
-        "type": "whisper_cpp",
-        "model": "large-v3-turbo-q5_0",
-        "model_url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
-      }
-    },
-    "openai": {
-      "base_url": "https://api.openai.com/v1",
-      "key_env": "OPENAI_API_KEY",
-      "transcribe": { "type": "openai_audio", "model": "gpt-4o-mini-transcribe", "diarize_model": "gpt-4o-transcribe-diarize" },
-      "summarize": { "type": "openai_chat", "model": "gpt-4o-mini" }
-    },
-    "openrouter": {
-      "base_url": "https://openrouter.ai/api/v1",
-      "key_env": "OPENROUTER_API_KEY",
-      "summarize": { "type": "openai_chat", "model": "anthropic/claude-3.5-sonnet" }
-    },
-    "gemini": {
-      "_comment": "Google Gemini. 0 EUR on the AI Studio free tier (Google may use the audio to improve its products). Transcription is a per-snippet hybrid: gemini-3.5-transcribe first, falling back to fallback_model on empty/looping output.",
-      "key_env": "GEMINI_API_KEY",
-      "transcribe": { "type": "gemini", "model": "gemini-3.5-transcribe", "fallback_model": "gemini-3.5-flash", "mode": "smart", "language_codes": ["fi-FI"] },
-      "summarize": { "type": "gemini", "model": "gemini-3.5-flash" }
-    }
-  },
-
   "summary": "on",
   "_comment_summary_language": "auto = write the notes in the same language as the transcript (Finnish meeting -> Finnish notes). Or force a language by name, e.g. \"Finnish\" / \"English\".",
   "summary_language": "auto",
@@ -88,10 +60,36 @@
   "meeting_owner": "",
   "meeting_owner_aliases": [],
   "summary_max_chars": 120000,
-  "snippet_seconds": 180,
+  "snippet_seconds": 600,
   "_comment_min_transcribe_seconds": "Recordings shorter than this are skipped before any API call.",
   "min_transcribe_seconds": 20,
   "max_parallel_transcriptions": 3,
   "orphan_job_min_age_seconds": 180,
-  "recorder_stop_grace_seconds": 30
+  "recorder_stop_grace_seconds": 30,
+  "_comment_kytkimet": "Käsittelysijainti ja laatu EIVÄT ole tässä tiedostossa: ne ovat kytkimiä tiedostossa switch_file (Dashboard muokkaa). Sijainti: maailmanlaajuinen (oletus, paras laatu) tai eu. Laatu: perus (oletus) tai huippu. Katso docs/PAATOKSET.md.",
+  "switch_file": "~/.meeting-transcriber/kytkimet.json",
+  "lamp_file": "~/.meeting-transcriber/lamppu.json",
+  "_comment_google": "Google AI Studio (GEMINI_API_KEY) maailmanlaajuisessa asennossa; Agent Platform EU (gcloud auth application-default login) EU-asennossa sekä yhteenvedoille ja tekstivaiheille. OpenAI:ta ei käytetä.",
+  "gemini_transcribe_model": "gemini-3.5-transcribe",
+  "gemini_transcribe_fallback_model": "gemini-3.5-flash",
+  "gemini_transcribe_mode": "smart",
+  "gemini_summary_model": "gemini-3.5-flash",
+  "gemini_language_codes": [
+    "fi-FI",
+    "en-US"
+  ],
+  "gemini_vocabulary_file": "~/.meeting-transcriber/sanasto.txt",
+  "agent_platform_project": "your-gcp-project-id",
+  "agent_platform_location": "eu",
+  "agent_platform_text_model": "gemini-3.5-flash",
+  "agent_platform_audio_model": "gemini-3.5-flash",
+  "max_adjudicator_model": "gemini-3.8-flash",
+  "summary_provider": "agent_platform",
+  "summary_fallback": [
+    "gemini"
+  ],
+  "snippet_split": "silence",
+  "snippet_max_seconds": 780,
+  "snippet_silence_window_seconds": 120,
+  "snippet_silence_db": -35
 }

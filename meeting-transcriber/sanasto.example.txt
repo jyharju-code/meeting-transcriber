@@ -1,0 +1,30 @@
+# Sanalista (Gemini 3.5 Transcribe custom_vocabulary ja Flash-kehote).
+# Kopioi tämä tiedosto polkuun, jonka config-asetus gemini_vocabulary_file kertoo
+# (oletus ~/.meeting-transcriber/sanasto.txt), ja lisää omat nimet ja termit.
+# Yksi termi per rivi, perusmuodossa. Paras tulos noin 100 termillä, enintään 1000.
+# Risuaidan (#) jälkeinen teksti ohitetaan, joten voit kirjoittaa huomautuksen rivin perään.
+#
+# Älä vie omaa sanastoasi julkiseen repoon: siinä on yleensä oikeiden ihmisten nimiä.
+
+# Ihmiset (omat kollegat, haastateltavat)
+Etunimi Sukunimi
+
+# Organisaatiot
+Valtiovarainministeriö
+Kuntaliitto
+Tilastokeskus
+
+# Yritykset ja palvelut
+Microsoft
+Copilot
+ChatGPT
+Gemini              # litteroituu joskus "Jemini"
+
+# Termit
+tekoäly
+generatiivinen tekoäly
+kielimalli
+digitaalinen suvereniteetti
+tekoälyasetus
+AI Act
+GDPR

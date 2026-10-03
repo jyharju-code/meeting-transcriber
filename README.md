@@ -6,7 +6,7 @@ Small local-first macOS meeting recorder and transcriber.
 
 It watches for Google Meet or Microsoft Teams calls, asks the native dashboard app
 to record system audio + microphone audio, then chunks, transcribes, and summarizes
-the recording with the OpenAI API.
+the recording with Google Gemini (global AI Studio, or EU-only via Agent Platform).
 
 The point is not to be a SaaS suite. It is a narrow tool:
 
@@ -16,22 +16,24 @@ The point is not to be a SaaS suite. It is a narrow tool:
 - TXT / Markdown / JSON transcript output
 - Markdown summary with action items first
 - local output folders under `~/.meeting-transcriber/output`
-- **pluggable engines**: local Whisper floor + bring-your-own-key for any provider
+- **two switches**: processing location (global / EU) and quality (perustaso / Huipputaso)
 
 ## Engines
 
 Transcription and summarization are provider-agnostic:
 
-- **Transcription** defaults to a fully local **whisper.cpp** floor (no key, no
-  network once cached). Install it with `meeting-transcriber/install_whisper.sh`.
-  OpenAI (or any OpenAI-compatible audio API) unlocks by setting its key.
-- **Summaries** run through any **OpenAI-compatible** chat endpoint — OpenAI,
-  **OpenRouter** (→ Claude, Gemini, Llama, Mistral, …), Groq, or a local Ollama
-  server — chosen by config alone, no extra dependencies.
+Only Google models are used:
 
-You pick providers (and a fallback chain ending at the local floor) in
-`config.json`; see [`meeting-transcriber/README.md`](meeting-transcriber/README.md).
-With no API keys at all, recording + local transcription still work end-to-end.
+- **Global position** (default, best quality): Google AI Studio, `gemini-3.5-transcribe`.
+- **EU position**: Gemini Enterprise Agent Platform EU only (`aiplatform.eu.rep.googleapis.com`).
+  If the EU service fails, processing may continue outside the EU, and a red lamp lights in the
+  dashboard and in the transcript.
+- **Huipputaso**: a quick version first, then several passes + an adjudicator model in the background.
+- Every outbound call is logged in the meeting folder, so you can show where a meeting was processed.
+
+A local **whisper.cpp** engine is available as an explicit offline option
+(`meeting-transcriber/install_whisper.sh`). See
+[`meeting-transcriber/README.md`](meeting-transcriber/README.md) for the switches and config.
 
 ## Consent
 
@@ -58,7 +60,8 @@ native-meeting-transcriber/
 - `ffmpeg`: `brew install ffmpeg`
 - **for local transcription:** `whisper-cpp` + a model — run
   `meeting-transcriber/install_whisper.sh`
-- **for API providers (optional):** a key for OpenAI and/or OpenRouter, etc.
+- a Google AI Studio key (`GEMINI_API_KEY`) for the global position
+- for the EU position: a Google Cloud project with Agent Platform and `gcloud auth application-default login`
 
 ## Setup
 
@@ -69,20 +72,17 @@ cd meeting-transcriber
 cp config.example.json config.json
 ```
 
-Put any provider keys in a local env file, one per line. Do not commit this file.
-Keys are optional — with none set, recording + local Whisper transcription still
-work. Add only the providers you want:
+Put the key in a local env file. Do not commit this file.
 
 ```bash
 umask 077
 cat > ~/.meeting-transcriber.env <<'ENV'
-OPENAI_API_KEY=your_openai_key_here
-# OPENROUTER_API_KEY=your_openrouter_key_here
+GEMINI_API_KEY=your_gemini_key_here
 ENV
 chmod 600 ~/.meeting-transcriber.env
 ```
 
-(Optional) install the local Whisper floor so transcription works with no keys:
+(Optional) install the local Whisper engine for offline use:
 
 ```bash
 cd meeting-transcriber
@@ -181,7 +181,7 @@ Leave `meeting_owner` empty for neutral notes.
 ## Costs
 
 The app uses pay-as-you-go API calls. Short false triggers under
-`min_transcribe_seconds` are skipped before any OpenAI API call.
+`min_transcribe_seconds` are skipped before any API call, and silent snippets are never sent.
 
 In one local test run, roughly 7,500 tokens and 22 API calls cost about $0.02.
 Your cost depends on meeting length, selected models, and summary settings.
@@ -194,7 +194,8 @@ Your cost depends on meeting length, selected models, and summary settings.
 | Automatic detection works but no recording starts | Keep the dashboard app running; the watcher will also try to reopen it from `/Applications`. |
 | Empty output folders | Restart the watcher; startup cleanup removes old folders with no recording or transcript. |
 | Very short recording has no transcript | Recordings under `min_transcribe_seconds` are intentionally skipped. |
-| `OPENAI_API_KEY is not set` | Check `~/.meeting-transcriber.env`. |
+| `GEMINI_API_KEY is not set` | Check `~/.meeting-transcriber.env`. |
+| Red lamp in the dashboard | An EU meeting was processed outside the EU, or the EU login expired: run `gcloud auth application-default login`. |
 | `ffmpeg` / `ffprobe` missing | Run `brew install ffmpeg`. |
 
 ## Uninstall

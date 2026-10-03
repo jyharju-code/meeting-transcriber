@@ -1,4 +1,4 @@
-# Meeting Transcriber — Python Watcher & Worker
+# Meeting Transcriber: Python watcher and worker
 
 This folder holds the two Python pieces. For full setup, the macOS permission
 trap, and the smoke test, see the [repository README](../README.md).
@@ -9,38 +9,45 @@ trap, and the smoke test, see the [repository README](../README.md).
 - `transcribe_recording.py` — the worker. Splits the recording into snippets with
   `ffmpeg`, transcribes them via the selected provider, writes the transcript in
   the requested format, and (optionally) a Markdown summary with action items.
-- `providers.py` — pluggable transcription/summary providers (see below).
+- `providers.py` — Google transcription/summary providers (see below).
+- `policy.py` — the two switches, their lock into each meeting, the call log and the red lamp.
+- `max_mode.py`, `tarkka.py` — Huipputaso (several passes + an adjudicator model).
 
-## Engines (providers)
+## Two switches decide where and how (docs/PAATOKSET.md)
 
-Transcription and summarization are provider-agnostic.
+The Dashboard shows two large switches, stored in `~/.meeting-transcriber/kytkimet.json`:
 
-- **Transcription floor:** local **whisper.cpp** (`large-v3-turbo` by default) —
-  no API key, no network once the model is cached. Install with
-  [`./install_whisper.sh`](install_whisper.sh) (`brew install whisper-cpp` + model
-  download). API transcription (OpenAI, or any OpenAI-compatible audio endpoint
-  like Groq) unlocks by setting its key.
-- **Summaries:** any **OpenAI-compatible** `/chat/completions` endpoint, chosen by
-  config alone — OpenAI, **OpenRouter** (→ Claude, Gemini, Llama, Mistral, …),
-  Groq, or a local Ollama server. No extra Python dependencies.
-- **Google Gemini** (native, `GEMINI_API_KEY`): **0 EUR on the AI Studio free tier**
-  (Google may use the audio to improve its products). Transcription is a per-snippet
-  hybrid — the dedicated `gemini-3.5-transcribe` (via `/v1beta/interactions`, not
-  `generateContent`) with automatic fallback to `gemini-3.5-flash` on empty/looping
-  output; summaries run on `gemini-3.5-flash`. Select with
-  `transcribe_provider`/`summary_provider: "gemini"`.
+| Switch | Positions | Meaning |
+|---|---|---|
+| **Käsittelysijainti** | 🌍 **MAAILMANLAAJUINEN** (default) / 🇪🇺 **EU** | Global = best quality: audio goes to Google AI Studio (`gemini-3.5-transcribe`). EU = audio and text go to Gemini Enterprise Agent Platform EU only (`aiplatform.eu.rep.googleapis.com`, `gemini-3.5-flash`). |
+| **Laatu** | **PERUSTASO** (default) / ★ **HUIPPUTASO** | Perustaso = one pass. Huipputaso = a quick version right away, then several passes + an adjudicator model in the background, replacing it (the quick version is kept as `*-perustaso.*`). |
 
-Summaries follow `summary_language`: `auto` (default) writes the notes in the same
-language as the transcript, with localized headings; or force a language by name.
+- The positions are locked into the meeting folder (`job.json`) when recording starts and again when
+  transcription starts. **Stricter wins:** EU if it was on at either moment, Huipputaso likewise.
+- **Nothing depends on the meeting title or content.**
+- If the EU service does not answer, processing may continue outside the EU (Google only), and then
+  the **red lamp** lights in the Dashboard and the transcript says so. The lamp also lights when the
+  EU login (`gcloud auth application-default login`) stops working.
+- Every outbound model call is logged in the meeting folder (`kutsut.jsonl`: host, model, result;
+  never the API key), so afterwards you can show where a meeting was processed.
+- OpenAI is not used at all.
+- Failures notify (macOS), show a red row in the Dashboard and are retried with a growing delay for
+  about a day. The raw recording is always kept.
 
-`transcribe_provider` / `summary_provider` pick the primary; `*_fallback` lists are
-tried in order, then any other available provider, ending at the local floor. Keys
-live in `~/.meeting-transcriber.env` (one `NAME=value` per line), never in
-`config.json`.
+| | perustaso (immediately) | Huipputaso (background) |
+|---|---|---|
+| 🌍 global | `gemini-3.5-transcribe` (smart; verbatim + vocabulary when Huipputaso is on) | Transcribe ×2 + Flash EU ×2, adjudicator `gemini-3.8-flash` (EU) |
+| 🇪🇺 EU | `gemini-3.5-flash` on Agent Platform EU | Flash EU ×2, adjudicator `gemini-3.8-flash` (EU) |
 
-The dashboard's Gemini model pickers write top-level model overrides. Provider
-construction applies those overrides to the explicit `providers.gemini` registry,
-so the selected dashboard model is the model used by the worker.
+Summaries and other text steps run on Agent Platform EU in both positions (AI Studio only if EU fails).
+Summaries follow `summary_language` (`auto` = same language as the transcript).
+
+Keys live in `~/.meeting-transcriber.env` (`GEMINI_API_KEY=...`), never in `config.json`.
+The vocabulary (`sanasto.example.txt` → `~/.meeting-transcriber/sanasto.txt`) stays on your machine.
+
+Testing from the command line: `--sijainti eu|maailmanlaajuinen`, `--laatu perus|huippu`
+(recorded in `job.json`; EU still wins), `--huipputaso` (run a queued upgrade),
+`--vain-yhteenveto` (redo the summary only).
 
 ## Install
 
@@ -74,7 +81,7 @@ store `meeting.json` with the detected subject, which the merge uses as title.
 
 ## Tests
 
-Pure-function unit tests — no network, no macOS APIs, no OpenAI SDK required:
+Unit tests: no network (every outbound call is mocked), no macOS APIs:
 
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py" -v
@@ -110,25 +117,23 @@ defaults shown when omitted. `~` is expanded in path values.
 | `record_command` | — | Argv for the direct backend; `{output}`/`{status}` are substituted. |
 | `status_file` | `~/.meeting-transcriber/status.json` | Live recorder status (level meters, etc.). |
 | `transcribe_after_recording` | `true` | Run the worker automatically when a recording finishes. |
-| `transcribe_output_format` | `md` | `txt`, `md`, `json`, or `diarized_json` (diarized needs a diarization-capable provider; otherwise degrades to `json`). |
-| `transcribe_provider` | `local_whisper`¹ | Primary transcription provider name. |
-| `transcribe_fallback` | `["openai"]` | Providers tried if the primary is unavailable. |
-| `summary_provider` | `openai` | Primary summary provider name. |
-| `summary_fallback` | `["openrouter"]` | Providers tried if the primary is unavailable. |
-| `providers` | see example | Registry: each entry may have a `transcribe` and/or `summarize` block. |
-| `models_dir` | `~/.meeting-transcriber/models` | Where Whisper models are cached. |
-| `whisper_auto_download` | `true` | Fetch the Whisper model on first use if missing. |
-| `whisper_language` | `auto` | Whisper language hint (`auto`, `en`, `fi`, …). |
+| `transcribe_output_format` | `md` | `txt`, `md`, `json`, or `diarized_json` (perustaso writes plain `json`; Huipputaso has speakers). |
+| `switch_file` / `lamp_file` | `~/.meeting-transcriber/kytkimet.json` / `lamppu.json` | Switch positions (Dashboard) and the red lamp state. |
+| `gemini_transcribe_model` / `gemini_transcribe_fallback_model` | `gemini-3.5-transcribe` / `gemini-3.5-flash` | Global position: AI Studio models (per-day limit on Transcribe switches to the fallback). |
+| `gemini_transcribe_mode` | `smart` | Global perustaso mode (`smart` or `verbatim`); Huipputaso always uses verbatim. |
+| `gemini_language_codes` | `["fi-FI"]` | Languages for gemini-3.5-transcribe. |
+| `gemini_vocabulary_file` | — | One term per line (see `sanasto.example.txt`); keep your own outside the repo. |
+| `agent_platform_project` / `agent_platform_location` | — / `eu` | Agent Platform project; only `eu` is allowed. Auth: gcloud ADC. |
+| `agent_platform_audio_model` / `agent_platform_text_model` | `gemini-3.5-flash` | EU models for audio and text steps. |
+| `max_adjudicator_model` | `gemini-3.8-flash` | Huipputaso adjudicator (EU). |
+| `summary_provider` / `summary_fallback` | `agent_platform` / `["gemini"]` | Summary chain; only the named providers are used. |
+| `snippet_split` / `snippet_seconds` / `snippet_max_seconds` | `silence` / `600` / `780` | Cut snippets at pauses near the target length (shared by perustaso and Huipputaso). |
+| `models_dir` / `whisper_*` | — | Local whisper.cpp (explicit offline option only). |
 | `summary` | `on` | `on`/`off` to toggle the summary step. |
-| `transcribe_model` / `diarize_model` / `summary_model` | — | **Legacy.** Used only when no `providers` block is present. |
 | `meeting_owner` | `""` | When set, first-person action items are attributed to this name. Empty = neutral. |
 | `meeting_owner_aliases` | `[]` | Extra names/spellings treated as the owner. |
 | `summary_max_chars` | `120000` | Transcript chars sent to the summary prompt (truncation is logged). |
-| `snippet_seconds` | `180` | Audio chunk length for transcription. |
 | `min_transcribe_seconds` | `20` | Recordings shorter than this are skipped before any API call. |
 | `max_parallel_transcriptions` | `3` | Concurrent snippet transcriptions. |
 | `orphan_job_min_age_seconds` | `180` | Age before an artifact-less job folder is swept on startup. |
 | `recorder_stop_grace_seconds` | `30` | Grace period when stopping the direct recorder. |
-
-¹ Legacy configs with no `provider`/`transcribe_provider` keys default to `openai`
-so existing setups keep their current behavior.

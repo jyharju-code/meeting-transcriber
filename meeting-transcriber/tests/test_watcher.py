@@ -173,10 +173,10 @@ class DashboardControlTests(unittest.TestCase):
             self.assertFalse(suppression.exists())
 
 
-SUBJECT = "Juhana Harju x Viran: julkiset hankinnat ja tekoäly"
-COMPACT = f"Meeting compact view | {SUBJECT} | Personal | jyharju@gmail.com | Microsoft Teams"
-JOIN = f"Meeting join | {SUBJECT} | Personal | jyharju@gmail.com | Microsoft Teams"
-STAGE = f"{SUBJECT} | Personal | jyharju@gmail.com | Microsoft Teams"
+SUBJECT = "Etunimi Sukunimi x Asiakas: projektipalaveri"
+COMPACT = f"Meeting compact view | {SUBJECT} | Personal | user@example.com | Microsoft Teams"
+JOIN = f"Meeting join | {SUBJECT} | Personal | user@example.com | Microsoft Teams"
+STAGE = f"{SUBJECT} | Personal | user@example.com | Microsoft Teams"
 
 
 class TeamsSubjectTests(unittest.TestCase):

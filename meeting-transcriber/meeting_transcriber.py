@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import policy
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
@@ -483,6 +485,7 @@ def start_recording(config: dict[str, Any], detection: Detection) -> tuple[subpr
         job_dir.mkdir(parents=True, exist_ok=True)
         audio_path = job_dir / "recording.mp4"
         write_meeting_meta(job_dir, detection)
+        policy.lock_job(job_dir, policy.read_switches(config), "nauhoitus")
         command_file = Path(config.get("dashboard_command_file", default_dashboard_command_file())).expanduser()
         ensure_dashboard_running(config)
         write_dashboard_command(config, command_file, "start", job_dir.name, audio_path, detection)
@@ -505,6 +508,7 @@ def start_recording(config: dict[str, Any], detection: Detection) -> tuple[subpr
     job_dir.mkdir(parents=True, exist_ok=True)
     audio_path = job_dir / f"recording.{audio_ext}"
     write_meeting_meta(job_dir, detection)
+    policy.lock_job(job_dir, policy.read_switches(config), "nauhoitus")
     status_path = Path(config["status_file"]).expanduser() if config.get("status_file") else None
     full_command = with_placeholders(command, audio_path, status_path)
     stdout_path = job_dir / "recorder.out.log"
@@ -575,13 +579,13 @@ def stop_recording(config: dict[str, Any], proc: subprocess.Popen[str] | Dashboa
             proc.kill()
 
 
-API_KEY_ENVS = ("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY")
+API_KEY_ENVS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 RECORDING_NAMES = ("recording.mp4", "recording.m4a", "recording.wav")
 
 
 def worker_command(config: dict[str, Any], audio_path: Path) -> list[str] | None:
     """Build the transcription worker command, or None (with a log line) if it cannot run."""
-    if not any(os.environ.get(name) for name in API_KEY_ENVS) and config.get("transcribe_provider") != "local_whisper":
+    if not any(os.environ.get(name) for name in API_KEY_ENVS) and not config.get("agent_platform_project"):
         log(config, "Skipping transcription; no transcription API key is set")
         return None
     worker = Path(config.get("transcription_worker", ROOT / "transcribe_recording.py")).expanduser()
@@ -616,6 +620,29 @@ def job_recording(job_dir: Path) -> Path | None:
 
 
 CATCHUP_ATTEMPTS_FILE = "catchup-attempts.txt"
+SUMMARY_ATTEMPTS_FILE = "yhteenveto-attempts.txt"
+UPGRADE_QUEUE = "huipputaso-jono.json"
+# Minutes to wait before attempt n+1 after n failed attempts: growing delay for about a day (D3).
+RETRY_MINUTES = (5, 10, 20, 40, 80, 160, 240, 240, 240, 240, 240)
+
+
+def retry_due(marker: Path, attempts: int, now: float) -> bool:
+    """True when a job that failed `attempts` times may be tried again."""
+    if attempts <= 0:
+        return True
+    if attempts > len(RETRY_MINUTES):
+        return False
+    try:
+        return now - marker.stat().st_mtime >= RETRY_MINUTES[attempts - 1] * 60
+    except OSError:
+        return True
+
+
+def read_count(path: Path) -> int:
+    try:
+        return int(path.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return 0
 
 
 def catchup_attempts(job_dir: Path) -> int:
@@ -630,8 +657,8 @@ def job_needs_transcription(
     now: float,
     min_age_s: float,
     max_age_s: float,
-    retry_after_s: float = 3600,
-    max_attempts: int = 6,
+    retry_after_s: float | None = None,
+    max_attempts: int | None = None,
 ) -> Path | None:
     """Return the recording of a job that still needs a transcript, else None.
 
@@ -647,10 +674,15 @@ def job_needs_transcription(
         state = read_json_object(progress) or {}
         if state.get("stage") in ("done", "skipped"):
             return None
-        if now - progress.stat().st_mtime < retry_after_s:
-            return None  # running, or failed too recently
-        if catchup_attempts(job_dir) >= max_attempts:
-            return None
+        attempts = catchup_attempts(job_dir)
+        if retry_after_s is None:
+            if not retry_due(progress, max(attempts, 1), now):
+                return None  # running, or failed too recently, or gave up after about a day
+        else:
+            if now - progress.stat().st_mtime < retry_after_s:
+                return None
+            if attempts >= (max_attempts or 6):
+                return None
     age = now - recording.stat().st_mtime
     if age < min_age_s or age > max_age_s:
         return None
@@ -674,29 +706,98 @@ def find_catchup_job(config: dict[str, Any], now: float, exclude: Path | None = 
         return None
     min_age = float(config.get("catchup_min_age_minutes", 10)) * 60
     max_age = float(config.get("catchup_max_age_hours", 48)) * 3600
-    retry_after = float(config.get("catchup_retry_minutes", 60)) * 60
-    max_attempts = int(config.get("catchup_max_attempts", 6))
     for job_dir in sorted((p for p in output_dir.iterdir() if p.is_dir()), reverse=True):
         if exclude is not None and job_dir == exclude:
             continue
-        recording = job_needs_transcription(job_dir, now, min_age, max_age, retry_after, max_attempts)
+        recording = job_needs_transcription(job_dir, now, min_age, max_age)
         if recording is not None:
             return recording
     return None
 
 
-def start_catchup(config: dict[str, Any], audio_path: Path) -> subprocess.Popen[str] | None:
+def job_needs_summary(job_dir: Path, now: float, max_age_s: float) -> Path | None:
+    """A transcript exists but its summary failed (stage summary_error): retry the summary alone."""
+    recording = job_recording(job_dir)
+    if recording is None or now - recording.stat().st_mtime > max_age_s:
+        return None
+    for name in ("progress-huipputaso.json", "progress.json"):
+        progress = job_dir / name
+        state = read_json_object(progress) or {}
+        if state.get("stage") == "summary_error":
+            attempts = read_count(job_dir / SUMMARY_ATTEMPTS_FILE)
+            return recording if retry_due(progress, attempts, now) else None
+        if progress.exists():
+            return None
+    return None
+
+
+def job_needs_upgrade(job_dir: Path, now: float, max_age_s: float) -> Path | None:
+    """Huipputaso is queued (or failed earlier and is due for a retry) and perustaso is finished."""
+    queue = job_dir / UPGRADE_QUEUE
+    recording = job_recording(job_dir)
+    if recording is None or not queue.exists() or now - recording.stat().st_mtime > max_age_s:
+        return None
+    base = (read_json_object(job_dir / "progress.json") or {}).get("stage")
+    if base not in ("done", "summary_error"):
+        return None
+    state = read_json_object(queue) or {}
+    attempts = int(state.get("yritykset", 0) or 0)
+    return recording if retry_due(queue, attempts, now) else None
+
+
+def find_work(config: dict[str, Any], now: float) -> tuple[str, Path] | None:
+    """Next background job: untranscribed recordings first, then summaries, then Huipputaso."""
+    pending = find_catchup_job(config, now)
+    if pending is not None:
+        return "litterointi", pending
+    output_dir = Path(config.get("output_dir", DEFAULT_OUTPUT)).expanduser()
+    if not output_dir.exists():
+        return None
+    max_age = float(config.get("catchup_max_age_hours", 48)) * 3600
+    jobs = sorted((p for p in output_dir.iterdir() if p.is_dir()), reverse=True)
+    for kind, check in (("yhteenveto", job_needs_summary), ("huipputaso", job_needs_upgrade)):
+        for job_dir in jobs:
+            recording = check(job_dir, now, max_age)
+            if recording is not None:
+                return kind, recording
+    return None
+
+
+def start_catchup(config: dict[str, Any], audio_path: Path, kind: str = "litterointi") -> subprocess.Popen[str] | None:
     cmd = worker_command(config, audio_path)
     if cmd is None:
         return None
-    log_path = audio_path.parent / "catchup-transcription.log"
+    job_dir = audio_path.parent
+    log_path = job_dir / {"litterointi": "catchup-transcription.log", "yhteenveto": "yhteenveto-uusinta.log",
+                          "huipputaso": "huipputaso.log"}[kind]
+    if kind == "yhteenveto":
+        cmd.append("--vain-yhteenveto")
+    elif kind == "huipputaso":
+        cmd.append("--huipputaso")
     try:
-        (audio_path.parent / CATCHUP_ATTEMPTS_FILE).write_text(str(catchup_attempts(audio_path.parent) + 1))
+        if kind == "litterointi":
+            (job_dir / CATCHUP_ATTEMPTS_FILE).write_text(str(catchup_attempts(job_dir) + 1))
+        elif kind == "yhteenveto":
+            (job_dir / SUMMARY_ATTEMPTS_FILE).write_text(str(read_count(job_dir / SUMMARY_ATTEMPTS_FILE) + 1))
         with log_path.open("w", encoding="utf-8") as handle:
             return subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT, text=True)
     except OSError as exc:
         log(config, f"Could not start catch-up transcription for {audio_path.parent}: {exc}")
         return None
+
+
+def notify_failure(config: dict[str, Any], kind: str, job_dir: Path) -> None:
+    """One notification per job and kind, on the first failure (later retries stay quiet)."""
+    marker = job_dir / f".ilmoitettu-{kind}"
+    if marker.exists():
+        return
+    try:
+        marker.write_text(policy.now_iso())
+    except OSError:
+        pass
+    what = {"litterointi": "litterointi", "yhteenveto": "yhteenveto", "huipputaso": "Huipputaso"}.get(kind, kind)
+    policy.notify(f"{what.capitalize()} odottaa",
+                  f"{job_dir.name}: {what} ei onnistunut. Yritetään uudelleen automaattisesti vuorokauden ajan.")
 
 
 def transcribe(config: dict[str, Any], audio_path: Path) -> None:
@@ -736,7 +837,9 @@ def watch(config_path: Path, once: bool = False) -> int:
     last_titles: list[str] = []
     catchup_proc: subprocess.Popen[str] | None = None
     catchup_job: Path | None = None
+    catchup_kind = ""
     last_catchup_scan = 0.0
+    last_login_check = 0.0
 
     log(config, "Meeting transcriber watcher started")
     sweep_orphan_job_folders(config)
@@ -849,11 +952,14 @@ def watch(config_path: Path, once: bool = False) -> int:
                 if finished_audio and not dashboard_recording:
                     transcribe(config, finished_audio)
 
-        # Background catch-up: never block meeting detection on a transcription.
+        # Background work (one job at a time, never while recording): untranscribed recordings,
+        # failed summaries and queued Huipputaso upgrades, retried with a growing delay (D3, D5).
         if catchup_proc is not None and catchup_proc.poll() is not None:
-            outcome = "done" if catchup_proc.returncode == 0 else f"failed (exit {catchup_proc.returncode})"
-            log(config, f"Catch-up transcription {outcome}: {catchup_job}")
-            catchup_proc, catchup_job = None, None
+            ok = catchup_proc.returncode == 0
+            log(config, f"Background {catchup_kind} {'done' if ok else f'failed (exit {catchup_proc.returncode})'}: {catchup_job}")
+            if not ok and catchup_job is not None:
+                notify_failure(config, catchup_kind, catchup_job)
+            catchup_proc, catchup_job, catchup_kind = None, None, ""
         now = time.time()
         if (
             config.get("catchup_transcription", True)
@@ -863,11 +969,20 @@ def watch(config_path: Path, once: bool = False) -> int:
             and not dashboard_is_recording(config, now)
         ):
             last_catchup_scan = now
-            pending = find_catchup_job(config, now)
-            if pending is not None:
-                log(config, f"Recording was never transcribed; transcribing it now: {pending.parent}")
-                catchup_proc = start_catchup(config, pending)
+            work = find_work(config, now)
+            if work is not None:
+                catchup_kind, pending = work
+                log(config, f"Background {catchup_kind}: {pending.parent}")
+                catchup_proc = start_catchup(config, pending, catchup_kind)
                 catchup_job = pending.parent if catchup_proc else None
+
+        # EU login check for the lamp (no API call, no cost).
+        if config.get("agent_platform_project") and now - last_login_check >= 15 * 60:
+            last_login_check = now
+            ok, detail = policy.check_eu_login()
+            policy.set_eu_login(ok, detail, config)
+            if not ok:
+                log(config, f"EU login not working: {detail}")
 
         time.sleep(poll_seconds)
 
