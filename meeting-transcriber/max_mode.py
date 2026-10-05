@@ -84,7 +84,7 @@ def turns_of(b: dict, offset: float = 0.0) -> list:
 
 
 def adjudicate(ap: tuple, idx: int, audio_part: dict, ts: dict, fl: dict, vocab: list,
-               max_ratio: float = 1.3) -> dict:
+               max_ratio: float = 1.3, generate=None) -> dict:
     """Final lines for one snippet, times relative to the snippet start (fixed later)."""
     b1 = turns_of(ts.get("b", {})) or turns_of(fl.get("b", {}))
     if not b1:
@@ -98,8 +98,8 @@ def adjudicate(ap: tuple, idx: int, audio_part: dict, ts: dict, fl: dict, vocab:
     for attempt, wait in enumerate(T.RETRY_WAITS):
         time.sleep(wait)
         try:
-            out = P.ap_generate(project, location, model, [{"text": prompt}, audio_part], temperature=0.0,
-                                max_output_tokens=65536, thinking_budget=4096)
+            out = (generate or P.ap_generate)(project, location, model, [{"text": prompt}, audio_part],
+                                               temperature=0.0, max_output_tokens=65536, thinking_budget=4096)
         except Exception as exc:  # noqa: BLE001
             T.log(f"adjudicate {idx} attempt {attempt + 1} failed: {exc}")
             continue
@@ -264,7 +264,8 @@ def run(config: dict, recording: Path, job_dir: Path, progress, use_transcribe: 
             return prev
         if fl_all[i].get("silent"):
             return {"lines": [], "method": "adjudicated (silent snippet skipped)", "backbone": []}
-        result = adjudicate(ap_judge, i, audio_part(snippets[i]), ts_all[i], fl_all[i], vocab)
+        result = adjudicate(ap_judge, i, audio_part(snippets[i]), ts_all[i], fl_all[i], vocab,
+                            generate=P.judge_generator(config) if use_transcribe else None)
         result["source"] = source
         path.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
         return result

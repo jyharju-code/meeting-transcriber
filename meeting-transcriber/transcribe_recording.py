@@ -524,15 +524,27 @@ def summarize_safely(config: dict[str, Any], job_dir: Path, text: str, progress:
                      options: dict[str, Any]) -> tuple[bool, str | None]:
     """Write summary.md. A failure is recorded (stage "summary_error") so the watcher retries the
     summary alone; the transcript is kept either way."""
-    summarizer = build_summarizer(config)
-    label = summarizer.model_label if summarizer else None
-    try:
-        summarize(summarizer, job_dir, text, progress, **options)
-        return True, label
-    except Exception as exc:  # noqa: BLE001
-        write_progress(progress, stage="summary_error", progress=1.0, message=f"Summary failed: {exc}")
-        print(f"transcribe_recording: summary failed: {exc}", file=sys.stderr)
-        return False, label
+    registry = providers.build_summarizers(config)
+    chain = [config.get("summary_provider", "agent_platform"), *(config.get("summary_fallback") or ["gemini"])]
+    candidates = [registry[n] for n in dict.fromkeys(chain) if n in registry and registry[n].available()]
+    label, last = None, None
+    for summarizer in candidates:  # the next named provider is tried when one fails at run time
+        label = summarizer.model_label
+        try:
+            summarize(summarizer, job_dir, text, progress, **options)
+            return True, label
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            print(f"transcribe_recording: summary with {label} failed: {exc}", file=sys.stderr)
+    if not candidates:
+        last = RuntimeError("no summary provider available")
+        try:
+            summarize(None, job_dir, text, progress, **options)
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    write_progress(progress, stage="summary_error", progress=1.0, message=f"Summary failed: {last}")
+    return False, label
 
 
 def write_manifest(job_dir: Path, recording: Path, level: str, transcriber_label: str | None,

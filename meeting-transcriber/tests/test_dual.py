@@ -218,5 +218,45 @@ class FallbackTests(unittest.TestCase):
             note.assert_called_once()
 
 
+class ExpiredLoginTests(unittest.TestCase):
+    """The gcloud login expires about daily (Workspace session control): the machine must keep going."""
+
+    def test_judge_uses_ai_studio_when_agent_platform_fails(self):
+        gen = providers.judge_generator({})
+        with mock.patch.object(providers, "ap_generate", side_effect=providers.ProviderError("no ADC token")), \
+                mock.patch.object(providers, "gemini_key", return_value="k"), \
+                mock.patch.object(providers, "studio_generate", return_value="[00:00:01] S1: Hei.") as studio:
+            self.assertEqual(gen("p", "eu", "gemini-3.8-flash", [{"text": "x"}]), "[00:00:01] S1: Hei.")
+        self.assertEqual(studio.call_args.args[1], "gemini-3.8-flash")
+
+    def test_judge_without_studio_permission_raises(self):
+        gen = providers.judge_generator({}, allow_studio=False)
+        with mock.patch.object(providers, "ap_generate", side_effect=providers.ProviderError("no ADC token")):
+            with self.assertRaises(providers.ProviderError):
+                gen("p", "eu", "m", [])
+
+    def test_summary_falls_back_at_run_time(self):
+        class Fake(providers.Summarizer):
+            def __init__(self, name, fail):
+                self.name, self.model_label, self.fail = name, name, fail
+
+            def available(self):
+                return True
+
+        registry = {"agent_platform": Fake("ap", True), "gemini": Fake("studio", False)}
+        used = []
+
+        def fake_summarize(summarizer, *a, **k):
+            used.append(summarizer.model_label)
+            if summarizer.fail:
+                raise providers.ProviderError("no ADC token")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(providers, "build_summarizers", return_value=registry), \
+                mock.patch.object(tr, "summarize", side_effect=fake_summarize):
+            ok, label = tr.summarize_safely({}, Path(tmp), "teksti", None, {})
+        self.assertEqual((ok, label, used), (True, "studio", ["ap", "studio"]))
+
+
 if __name__ == "__main__":
     unittest.main()

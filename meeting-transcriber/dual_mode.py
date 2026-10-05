@@ -91,6 +91,7 @@ def run(config: dict, recording: Path, job_dir: Path, progress) -> str:
     T._TEXT = gen
     project, location, _ = P.ap_settings(config)
     judge = (project, location, str(config.get("max_adjudicator_model", "gemini-3.8-flash")))
+    judge_gen = P.judge_generator(config)  # global position: AI Studio if the EU login has expired
     vocab = P.load_vocabulary(config)
     ffmpeg = P.ffmpeg_path(config)
     duration = TR.recording_duration_seconds(recording) or 0.0
@@ -157,7 +158,8 @@ def run(config: dict, recording: Path, job_dir: Path, progress) -> str:
         clip = window_audio(i, w)
         a1 = second_ear(i, w, clip)
         part = {"inlineData": {"mimeType": "audio/mpeg", "data": base64.b64encode(clip.read_bytes()).decode("ascii")}}
-        result = MM.adjudicate(judge, i, part, {"b": {"turns": b1}, "a": {"text": a1}}, {}, vocab, max_ratio=1.6)
+        result = MM.adjudicate(judge, i, part, {"b": {"turns": b1}, "a": {"text": a1}}, {}, vocab, max_ratio=1.6,
+                               generate=judge_gen)
         result.pop("backbone", None)
         result["source"] = source
         path.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -190,7 +192,7 @@ def run(config: dict, recording: Path, job_dir: Path, progress) -> str:
     readable = [l for c in cleaned for l in c["lines"]]
     names = sorted({v for v in mapping.values() if not v.startswith("Puhuja")})
     uncertain = sum(l["text"].count("[?]") for l in verbatim)
-    header = [f"Huipputaso: {route}; tuomarimalli {judge[2]} (EU) kuunteli äänen ja ratkaisi erot.",
+    header = [f"Huipputaso: {route}; tuomarimalli {judge[2]} kuunteli äänen ja ratkaisi erot.",
               "Puhujat nimetty tekstin perusteella, tarkista: " + (", ".join(names) or "ei varmoja nimiä") + ".",
               f"[?] = epävarma kohta, tarkista kuuntelemalla ({uncertain} kpl)."]
     failed = [f"jakso {i + 1}" for i, s in enumerate(segments) if s["method"].startswith("backbone only")]

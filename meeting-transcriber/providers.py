@@ -351,12 +351,18 @@ def gemini_transcribe_generate(api_key, file_uri, mime, language_codes, model, t
 
 def gemini_generate_text(api_key: str, model: str, prompt: str, temperature: float = 0.2,
                          max_output_tokens=None, thinking_budget=None) -> str:
+    return studio_generate(api_key, model, [{"text": prompt}], temperature, max_output_tokens, thinking_budget)
+
+
+def studio_generate(api_key: str, model: str, parts: list, temperature: float = 0.2,
+                    max_output_tokens=None, thinking_budget=None) -> str:
+    """generateContent on Google AI Studio; parts may include inline audio."""
     gen: dict[str, Any] = {"temperature": temperature}
     if max_output_tokens:
         gen["maxOutputTokens"] = int(max_output_tokens)
     if thinking_budget is not None:
         gen["thinkingConfig"] = {"thinkingBudget": int(thinking_budget)}
-    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
+    body = {"contents": [{"parts": parts}], "generationConfig": gen}
     req = urllib.request.Request(
         f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={api_key}",
         data=json.dumps(body).encode("utf-8"),
@@ -435,6 +441,23 @@ def ap_generate(project: str, location: str, model: str, parts: list, temperatur
 def ap_settings(config: dict) -> tuple:
     return (str(config.get("agent_platform_project", "")), str(config.get("agent_platform_location", "eu")),
             str(config.get("agent_platform_text_model", GEMINI_FALLBACK_MODEL)))
+
+
+def judge_generator(config: dict, allow_studio: bool = True):
+    """ap_generate-compatible callable: Agent Platform EU first; if it fails (e.g. the gcloud login
+    expired) and allow_studio, the same model through AI Studio with the API key."""
+    def generate(project, location, model, parts, temperature=0.0, max_output_tokens=None,
+                 thinking_budget=None, response_schema=None):
+        try:
+            return ap_generate(project, location, model, parts, temperature, max_output_tokens,
+                               thinking_budget, response_schema)
+        except ProviderError as exc:
+            key = gemini_key(None)
+            if not (allow_studio and key) or response_schema:
+                raise
+            print(f"providers: Agent Platform failed ({str(exc)[:120]}); judge via AI Studio", file=sys.stderr)
+            return studio_generate(key, model, parts, temperature, max_output_tokens, thinking_budget)
+    return generate
 
 
 def text_generator(config: dict):
