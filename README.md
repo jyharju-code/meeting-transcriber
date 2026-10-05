@@ -6,7 +6,8 @@ Small local-first macOS meeting recorder and transcriber.
 
 It watches for Google Meet or Microsoft Teams calls, asks the native dashboard app
 to record system audio + microphone audio, then chunks, transcribes, and summarizes
-the recording with Google Gemini (global AI Studio, or EU-only via Agent Platform).
+the recording: Soniox and Microsoft MAI-Transcribe-2 with a Gemini adjudicator (global), or Google
+Gemini on Agent Platform EU only (EU position).
 
 The point is not to be a SaaS suite. It is a narrow tool:
 
@@ -22,9 +23,8 @@ The point is not to be a SaaS suite. It is a narrow tool:
 
 Transcription and summarization are provider-agnostic:
 
-Only Google models are used:
-
-- **Global position** (default, best quality): Google AI Studio, `gemini-3.5-transcribe`.
+- **Global position** (default, best quality): Soniox (perustaso); Huipputaso = Soniox + Microsoft
+  MAI-Transcribe-2 (Azure Speech), and Gemini listens to the audio where they disagree.
 - **EU position**: Gemini Enterprise Agent Platform EU only (`aiplatform.eu.rep.googleapis.com`).
   If the EU service fails, processing may continue outside the EU, and a red lamp lights in the
   dashboard and in the transcript.
@@ -60,7 +60,8 @@ native-meeting-transcriber/
 - `ffmpeg`: `brew install ffmpeg`
 - **for local transcription:** `whisper-cpp` + a model — run
   `meeting-transcriber/install_whisper.sh`
-- a Google AI Studio key (`GEMINI_API_KEY`) for the global position
+- keys for the global position: Soniox (`SONIOX_API_KEY`), Azure Speech (`AZURE_SPEECH_F0_KEY`,
+  `AZURE_SPEECH_S0_KEY`) and Google AI Studio (`GEMINI_API_KEY`)
 - for the EU position: a Google Cloud project with Agent Platform and `gcloud auth application-default login`
 
 ## Setup
@@ -78,6 +79,9 @@ Put the key in a local env file. Do not commit this file.
 umask 077
 cat > ~/.meeting-transcriber.env <<'ENV'
 GEMINI_API_KEY=your_gemini_key_here
+SONIOX_API_KEY=your_soniox_key_here
+AZURE_SPEECH_F0_KEY=your_free_azure_speech_key
+AZURE_SPEECH_S0_KEY=your_paid_azure_speech_key
 ENV
 chmod 600 ~/.meeting-transcriber.env
 ```

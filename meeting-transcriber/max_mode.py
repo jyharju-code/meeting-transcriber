@@ -83,7 +83,8 @@ def turns_of(b: dict, offset: float = 0.0) -> list:
     return [dict(t, speaker=label(t["speaker"])) for t in turns]
 
 
-def adjudicate(ap: tuple, idx: int, audio_part: dict, ts: dict, fl: dict, vocab: list) -> dict:
+def adjudicate(ap: tuple, idx: int, audio_part: dict, ts: dict, fl: dict, vocab: list,
+               max_ratio: float = 1.3) -> dict:
     """Final lines for one snippet, times relative to the snippet start (fixed later)."""
     b1 = turns_of(ts.get("b", {})) or turns_of(fl.get("b", {}))
     if not b1:
@@ -105,7 +106,8 @@ def adjudicate(ap: tuple, idx: int, audio_part: dict, ts: dict, fl: dict, vocab:
         lines = T.parse_lines(out)
         bw = sum(T.word_count(t["text"]) for t in b1)
         lw = sum(T.word_count(l["text"]) for l in lines)
-        if len(lines) >= 0.8 * len(b1) and 0.75 * bw <= lw <= 1.3 * bw:
+        # A cleaned backbone (Soniox) is shorter than the verbatim result, hence max_ratio.
+        if len(lines) >= 0.8 * len(b1) and 0.75 * bw <= lw <= max_ratio * bw:
             return {"lines": lines, "method": "adjudicated (4 sources + audio)", "backbone": b1}
         T.log(f"adjudicate {idx} attempt {attempt + 1} rejected: {len(lines)}/{len(b1)} lines, {lw}/{bw} words")
     lines = [{"time": T.hms(t["start"]), "speaker": t["speaker"], "text": t["text"]} for t in b1]

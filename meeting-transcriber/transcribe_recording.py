@@ -563,10 +563,53 @@ def finish_outputs(config: dict[str, Any], job_dir: Path) -> None:
     policy.report_violation(job_dir, config)
 
 
+def soniox_perustaso(config: dict[str, Any], recording: Path, job_dir: Path, progress: Path) -> str | None:
+    """Global perustaso (D8): Soniox, whole recording in one call. None if Soniox is unavailable."""
+    import dual_mode
+    import tarkka
+
+    soniox = dual_mode.soniox_from_config(config)
+    if not soniox.available():
+        return None
+    write_progress(progress, stage="transcribing", progress=0.1, message="Transcribing with Soniox")
+    try:
+        audio = providers.recording_mp3(providers.ffmpeg_path(config), recording, job_dir / "audio-16k.mp3")
+    except Exception as exc:  # noqa: BLE001
+        print(f"transcribe_recording: MP3 conversion failed: {exc}", file=sys.stderr)
+        return None
+    data = dual_mode.cached_run(job_dir, dual_mode.SONIOX_CACHE, soniox, audio, recording_duration_seconds(recording) or 0.0)
+    if not data:
+        print("transcribe_recording: Soniox failed; falling back to Gemini", file=sys.stderr)
+        return None
+    lines = [{"time": tarkka.hms(t["start"]), "speaker": f"Puhuja {t['speaker'].lstrip('S')}", "text": t["text"]}
+             for t in data["turns"]]
+    return tarkka.format_lines(lines)
+
+
 def run_perustaso(config: dict[str, Any], args: argparse.Namespace, recording: Path, job_dir: Path,
                   progress: Path, settings: dict[str, str]) -> int:
     requested_format = config["transcribe_output_format"]
     summary_enabled = (args.summary or config.get("summary", "on")) != "off"
+    huippu = settings["laatu"] == policy.HUIPPU
+    if settings["sijainti"] == policy.GLOBAL and str(config.get("global_perustaso", "soniox")) == "soniox":
+        text = soniox_perustaso(config, recording, job_dir, progress)
+        if text is not None:
+            fmt = "json" if requested_format == "diarized_json" else requested_format
+            write_transcript_outputs(job_dir, fmt, text, [{"model": "soniox", "text": text}], [])
+            summary_ok, summary_label = True, None
+            if summary_enabled:
+                summary_ok, summary_label = summarize_safely(config, job_dir, text, progress, summary_options(config, args))
+            write_manifest(job_dir, recording, "perustaso", "soniox:" + str(config.get("soniox_model", "stt-async-v5")),
+                           summary_label, [])
+            finish_outputs(config, job_dir)
+            if huippu:
+                (job_dir / UPGRADE_QUEUE).write_text(
+                    json.dumps({"tila": "jonossa", "aika": policy.now_iso(), "yritykset": 0}, indent=2), encoding="utf-8")
+            if not summary_ok:
+                return 1
+            write_progress(progress, stage="done", progress=1.0,
+                           message="Perustaso valmis, Huipputaso jonossa" if huippu else "Done")
+            return 0
     transcriber = build_transcriber(config, settings)
     if transcriber is None:
         message = "No transcription service available (no Gemini API key and no EU service)."
@@ -600,7 +643,6 @@ def run_perustaso(config: dict[str, Any], args: argparse.Namespace, recording: P
     summary_ok, summary_label = True, None
     if summary_enabled:
         summary_ok, summary_label = summarize_safely(config, job_dir, text, progress, summary_options(config, args))
-    huippu = settings["laatu"] == policy.HUIPPU
     write_manifest(job_dir, recording, "perustaso", transcriber.model_label, summary_label, snippets)
     finish_outputs(config, job_dir)
     if huippu:
@@ -627,8 +669,18 @@ def run_huipputaso(config: dict[str, Any], args: argparse.Namespace, recording: 
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
     write_progress(progress, stage="starting", progress=0.01, message="Huipputaso starting")
+    (job_dir / "huipputaso.json").unlink(missing_ok=True)
     try:
-        readable = max_mode.run(config, recording, job_dir, progress, use_transcribe=settings["sijainti"] == policy.GLOBAL)
+        readable = None
+        if settings["sijainti"] == policy.GLOBAL and str(config.get("global_huipputaso", "soniox_mai")) == "soniox_mai":
+            import dual_mode
+            try:
+                readable = dual_mode.run(config, recording, job_dir, progress)
+            except Exception as exc:  # noqa: BLE001
+                print(f"transcribe_recording: Soniox + MAI unavailable ({exc}); old Gemini Huipputaso", file=sys.stderr)
+                policy.notify("Huipputaso heikennetty", f"{job_dir.name}: Soniox ja MAI eivät vastanneet, käytetään Gemini-Huipputasoa.")
+        if readable is None:
+            readable = max_mode.run(config, recording, job_dir, progress, use_transcribe=settings["sijainti"] == policy.GLOBAL)
     except Exception as exc:  # noqa: BLE001
         for name in keep:  # put the quick version back so the folder stays consistent
             src = job_dir / name.replace(".", "-perustaso.", 1)
@@ -642,7 +694,8 @@ def run_huipputaso(config: dict[str, Any], args: argparse.Namespace, recording: 
         finish_outputs(config, job_dir)
         return 1
     summary_ok, summary_label = summarize_safely(config, job_dir, readable, progress, summary_options(config, args))
-    write_manifest(job_dir, recording, "huipputaso", "huipputaso", summary_label,
+    route = policy._read_json(job_dir / "huipputaso.json").get("reitti") if (job_dir / "huipputaso.json").exists() else None
+    write_manifest(job_dir, recording, "huipputaso", route or "huipputaso (Gemini)", summary_label,
                    sorted((job_dir / "snippets").glob("snippet-*.m4a")))
     finish_outputs(config, job_dir)
     queue.unlink(missing_ok=True)

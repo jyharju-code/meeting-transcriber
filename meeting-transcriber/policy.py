@@ -30,7 +30,7 @@ PERUS = "perus"
 HUIPPU = "huippu"
 SIJAINNIT = (GLOBAL, EU)
 LAADUT = (PERUS, HUIPPU)
-DEFAULTS = {"sijainti": GLOBAL, "laatu": PERUS}
+DEFAULTS = {"sijainti": GLOBAL, "laatu": HUIPPU}  # D10: Huipputaso on by default
 
 EU_HOSTS = frozenset({"aiplatform.eu.rep.googleapis.com"})
 RUNTIME = Path("~/.meeting-transcriber").expanduser()
@@ -129,6 +129,12 @@ def describe_request(url: str, body: bytes | None = None) -> dict[str, str]:
     """Host, kind and model of a request, without the query string (the API key travels there)."""
     parts = urlsplit(url)
     path = parts.path
+    host = parts.hostname or ""
+    if host.endswith("soniox.com"):
+        kind = "soniox-" + ("file" if "/v1/files" in path else "transcription")
+        return {"host": host, "kind": kind, "model": "stt-async"}
+    if host.endswith("cognitiveservices.azure.com"):
+        return {"host": host, "kind": "azure-fast-transcription", "model": "MAI-Transcribe-2"}
     if "/upload/" in path:
         kind = "upload"
     elif path.endswith("/interactions"):
@@ -191,7 +197,23 @@ def status_line(job_dir: Path) -> str:
             return (f"> 🔴 **Käsitelty: EU-asento, mutta osa käsittelystä tehtiin EU:n ulkopuolella** "
                     f"({', '.join(hosts)}), koska EU-palvelu ei vastannut. {laatu}.")
         return f"> 🇪🇺 **Käsitelty: EU** (vain EU-palvelu). {laatu}."
-    return f"> 🌍 **Käsitelty: maailmanlaajuinen** (Google AI Studio sallittu). {laatu}."
+    used = service_names(job_dir)
+    return f"> 🌍 **Käsitelty: maailmanlaajuinen** ({', '.join(used) if used else 'Google'}). {laatu}."
+
+
+SERVICES = (("soniox.com", "Soniox"), ("cognitiveservices.azure.com", "Microsoft Azure (MAI)"),
+            ("aiplatform.eu.rep.googleapis.com", "Google EU"), ("googleapis.com", "Google AI Studio"))
+
+
+def service_names(job_dir: Path) -> list[str]:
+    """Services that answered at least one call for this meeting, in a fixed order."""
+    hosts = {c.get("host", "") for c in calls(job_dir) if c.get("tulos") == "ok"}
+    out = []
+    for suffix, label in SERVICES:
+        if label not in out and any(h.endswith(suffix) and not (label == "Google AI Studio" and h.startswith("aiplatform.eu"))
+                                    for h in hosts):
+            out.append(label)
+    return out
 
 
 def stamp_outputs(job_dir: Path, names: tuple[str, ...] = ("transcript.md", "transcript-luettava.md", "summary.md")) -> None:

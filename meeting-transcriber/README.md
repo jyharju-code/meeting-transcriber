@@ -9,9 +9,10 @@ trap, and the smoke test, see the [repository README](../README.md).
 - `transcribe_recording.py` — the worker. Splits the recording into snippets with
   `ffmpeg`, transcribes them via the selected provider, writes the transcript in
   the requested format, and (optionally) a Markdown summary with action items.
-- `providers.py` — Google transcription/summary providers (see below).
+- `providers.py` — transcription/summary providers: Soniox, Microsoft MAI (Azure Speech), Google.
 - `policy.py` — the two switches, their lock into each meeting, the call log and the red lamp.
-- `max_mode.py`, `tarkka.py` — Huipputaso (several passes + an adjudicator model).
+- `dual_mode.py` — Huipputaso, global position: Soniox + MAI, an adjudicator model listens (D9).
+- `max_mode.py`, `tarkka.py` — Huipputaso with Gemini only (EU position and last fallback).
 
 ## Two switches decide where and how (docs/PAATOKSET.md)
 
@@ -19,8 +20,8 @@ The Dashboard shows two large switches, stored in `~/.meeting-transcriber/kytkim
 
 | Switch | Positions | Meaning |
 |---|---|---|
-| **Käsittelysijainti** | 🌍 **MAAILMANLAAJUINEN** (default) / 🇪🇺 **EU** | Global = best quality: audio goes to Google AI Studio (`gemini-3.5-transcribe`). EU = audio and text go to Gemini Enterprise Agent Platform EU only (`aiplatform.eu.rep.googleapis.com`, `gemini-3.5-flash`). |
-| **Laatu** | **PERUSTASO** (default) / ★ **HUIPPUTASO** | Perustaso = one pass. Huipputaso = a quick version right away, then several passes + an adjudicator model in the background, replacing it (the quick version is kept as `*-perustaso.*`). |
+| **Käsittelysijainti** | 🌍 **MAAILMANLAAJUINEN** (default) / 🇪🇺 **EU** | Global = best quality: Soniox, Microsoft MAI (Azure Speech, Sweden Central) and Google. EU = audio and text go to Gemini Enterprise Agent Platform EU only (`aiplatform.eu.rep.googleapis.com`, `gemini-3.5-flash`). |
+| **Laatu** | ★ **HUIPPUTASO** (default, D10) / **PERUSTASO** | Perustaso = one pass. Huipputaso = a quick version right away, then several passes + an adjudicator model in the background, replacing it (the quick version is kept as `*-perustaso.*`). |
 
 - The positions are locked into the meeting folder (`job.json`) when recording starts and again when
   transcription starts. **Stricter wins:** EU if it was on at either moment, Huipputaso likewise.
@@ -31,18 +32,22 @@ The Dashboard shows two large switches, stored in `~/.meeting-transcriber/kytkim
 - Every outbound model call is logged in the meeting folder (`kutsut.jsonl`: host, model, result;
   never the API key), so afterwards you can show where a meeting was processed.
 - OpenAI is not used at all.
+- Global Huipputaso never stops on one service: Soniox + MAI → Soniox + Gemini → MAI + Gemini → Gemini only.
+  Every downgrade is written into the transcript and notified. MAI uses the free Azure resource first,
+  then the paid one up to `azure_paid_hours_per_month`.
 - Failures notify (macOS), show a red row in the Dashboard and are retried with a growing delay for
   about a day. The raw recording is always kept.
 
 | | perustaso (immediately) | Huipputaso (background) |
 |---|---|---|
-| 🌍 global | `gemini-3.5-transcribe` (smart; verbatim + vocabulary when Huipputaso is on) | Transcribe ×2 + Flash EU ×2, adjudicator `gemini-3.8-flash` (EU) |
+| 🌍 global | Soniox `stt-async-v5` (whole recording, speakers) | Soniox + MAI-Transcribe-2, adjudicator `gemini-3.8-flash` (EU) |
 | 🇪🇺 EU | `gemini-3.5-flash` on Agent Platform EU | Flash EU ×2, adjudicator `gemini-3.8-flash` (EU) |
 
 Summaries and other text steps run on Agent Platform EU in both positions (AI Studio only if EU fails).
 Summaries follow `summary_language` (`auto` = same language as the transcript).
 
-Keys live in `~/.meeting-transcriber.env` (`GEMINI_API_KEY=...`), never in `config.json`.
+Keys live in `~/.meeting-transcriber.env` (`GEMINI_API_KEY`, `SONIOX_API_KEY`, `AZURE_SPEECH_F0_KEY`,
+`AZURE_SPEECH_S0_KEY`), never in `config.json`.
 The vocabulary (`sanasto.example.txt` → `~/.meeting-transcriber/sanasto.txt`) stays on your machine.
 
 Testing from the command line: `--sijainti eu|maailmanlaajuinen`, `--laatu perus|huippu`
@@ -119,6 +124,10 @@ defaults shown when omitted. `~` is expanded in path values.
 | `transcribe_after_recording` | `true` | Run the worker automatically when a recording finishes. |
 | `transcribe_output_format` | `md` | `txt`, `md`, `json`, or `diarized_json` (perustaso writes plain `json`; Huipputaso has speakers). |
 | `switch_file` / `lamp_file` | `~/.meeting-transcriber/kytkimet.json` / `lamppu.json` | Switch positions (Dashboard) and the red lamp state. |
+| `global_perustaso` / `global_huipputaso` | `soniox` / `soniox_mai` | Global position routes (D8, D9); `gemini` restores the Google-only route. |
+| `soniox_base_url` / `soniox_model` / `soniox_language_hints` | `https://api.soniox.com` / `stt-async-v5` / `["fi","en"]` | Soniox async API (EU project: `https://api.eu.soniox.com`). |
+| `azure_mai_endpoints` | — | Azure Speech resources for MAI-Transcribe-2, tried in order: `{"name","url","key_env","paid"}`. |
+| `azure_mai_locales` / `azure_paid_hours_per_month` | `["fi"]` / `50` | MAI language hint; monthly cap for the paid resource (usage in `azure_usage_file`). |
 | `gemini_transcribe_model` / `gemini_transcribe_fallback_model` | `gemini-3.5-transcribe` / `gemini-3.5-flash` | Global position: AI Studio models (per-day limit on Transcribe switches to the fallback). |
 | `gemini_transcribe_mode` | `smart` | Global perustaso mode (`smart` or `verbatim`); Huipputaso always uses verbatim. |
 | `gemini_language_codes` | `["fi-FI"]` | Languages for gemini-3.5-transcribe. |

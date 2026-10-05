@@ -22,10 +22,12 @@ import transcribe_recording as tr  # noqa: E402
 
 
 class SwitchTests(unittest.TestCase):
-    def test_defaults_are_global_and_perustaso(self):
-        self.assertEqual(policy.normalize({}), {"sijainti": "maailmanlaajuinen", "laatu": "perus"})
+    def test_defaults_are_global_and_huipputaso(self):
+        # D10: Huipputaso is on by default.
+        self.assertEqual(policy.normalize({}), {"sijainti": "maailmanlaajuinen", "laatu": "huippu"})
         self.assertEqual(policy.normalize({"sijainti": "mars", "laatu": "?"}),
-                         {"sijainti": "maailmanlaajuinen", "laatu": "perus"})
+                         {"sijainti": "maailmanlaajuinen", "laatu": "huippu"})
+        self.assertEqual(policy.normalize({"laatu": "perus"})["laatu"], "perus")
 
     def test_read_write_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,7 +58,7 @@ class SwitchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             (job / "meeting.json").write_text(json.dumps({"subject": "EU-haastattelu: luottamuksellinen"}), encoding="utf-8")
-            locked = policy.lock_job(job, {}, "litterointi")
+            locked = policy.lock_job(job, {"sijainti": "maailmanlaajuinen", "laatu": "perus"}, "litterointi")
             self.assertEqual((locked["sijainti"], locked["laatu"]), ("maailmanlaajuinen", "perus"))
 
 

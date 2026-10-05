@@ -25,14 +25,14 @@ let sijaintiEU = "eu"
 let laatuPerus = "perus"
 let laatuHuippu = "huippu"
 
-/// Read switch positions; anything unknown falls back to the defaults (global, perustaso).
+/// Read switch positions; anything unknown falls back to the defaults (global, Huipputaso: D10).
 func readSwitches(from url: URL) -> (sijainti: String, laatu: String) {
     guard let data = try? Data(contentsOf: url),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        return (sijaintiGlobal, laatuPerus)
+        return (sijaintiGlobal, laatuHuippu)
     }
     let s = (object["sijainti"] as? String)?.lowercased() == sijaintiEU ? sijaintiEU : sijaintiGlobal
-    let l = (object["laatu"] as? String)?.lowercased() == laatuHuippu ? laatuHuippu : laatuPerus
+    let l = (object["laatu"] as? String)?.lowercased() == laatuPerus ? laatuPerus : laatuHuippu
     return (s, l)
 }
 
@@ -386,7 +386,7 @@ final class DashboardModel: ObservableObject {
     @Published var currentOutput = ""
     @Published var transcriptFormat = "md"
     @Published private(set) var sijainti = sijaintiGlobal
-    @Published private(set) var laatu = laatuPerus
+    @Published private(set) var laatu = laatuHuippu
     @Published private(set) var lampRed = false
     @Published private(set) var lampText = ""
     @Published var summaryEnabled = true

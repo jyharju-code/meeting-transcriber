@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Transcription and summarization providers (Google only).
+"""Transcription and summarization providers.
 
+- Soniox async API (SONIOX_API_KEY): global perustaso and one ear of Huipputaso (D8, D9).
+- Microsoft MAI-Transcribe-2 on Azure Speech, Sweden Central (AZURE_SPEECH_*_KEY): the other ear (D9).
 - Google AI Studio (API key): gemini-3.5-transcribe (Interactions API) and gemini-3.5-flash.
 - Gemini Enterprise Agent Platform, EU endpoint only (gcloud ADC): gemini-3.5-flash / 3.8-flash.
 - A local whisper.cpp transcriber is available as an explicit, offline option.
 
-Which of these a meeting may use is decided by the location switch (policy.py, D1-D3 in
-docs/PAATOKSET.md). Every outbound model call goes through gemini_http(), which records it in
+Which of these a meeting may use is decided by the location switch (policy.py, D1-D3 and D11 in
+docs/PAATOKSET.md). Every outbound call goes through gemini_http() or api_http(), which record it in
 the job's call log; nothing here falls back implicitly to a provider that was not named.
 """
 
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import urllib.request
 import zlib
 from pathlib import Path
@@ -789,6 +792,250 @@ class AgentPlatformTranscriber(Transcriber):
 # --------------------------------------------------------------------------- #
 # Summarization
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Whole-recording recognizers (D8, D9): Soniox and Microsoft MAI-Transcribe-2 on Azure Speech
+# --------------------------------------------------------------------------- #
+
+def api_http(method: str, url: str, headers: dict, body: bytes | None = None, timeout: int = 900,
+             attempts: int = 4) -> bytes:
+    """One HTTP call through the call log; retries 429/5xx and dropped connections."""
+    import http.client
+    import urllib.error
+
+    import policy
+
+    delay = 5.0
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            policy.record_call(url, None, "ok")
+            return data
+        except urllib.error.HTTPError as exc:
+            policy.record_call(url, None, f"HTTP {exc.code}")
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:400]
+            except Exception:  # noqa: BLE001
+                pass
+            if exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 60.0)
+                continue
+            raise ProviderError(f"HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.IncompleteRead) as exc:
+            policy.record_call(url, None, f"virhe: {type(exc).__name__}")
+            if attempt < attempts - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 60.0)
+                continue
+            raise ProviderError(f"{type(exc).__name__}: {exc}") from exc
+    raise ProviderError("unreachable")
+
+
+def multipart_body(fields: list, files: list) -> tuple[str, bytes]:
+    boundary = uuid.uuid4().hex
+    out = bytearray()
+    for name, value in fields:
+        out += f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+    for name, filename, data, ctype in files:
+        out += (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f"Content-Type: {ctype}\r\n\r\n").encode() + data + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return f"multipart/form-data; boundary={boundary}", bytes(out)
+
+
+def recording_mp3(ffmpeg: str, recording: Path, out: Path) -> Path:
+    """Mono 16 kHz 64 kbps MP3 of the whole recording (about 29 MB per hour)."""
+    if out.exists() and out.stat().st_mtime >= recording.stat().st_mtime:
+        return out
+    result = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(recording),
+                             "-ac", "1", "-ar", "16000", "-b:a", "64k", str(out)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ProviderError(result.stderr.strip() or "ffmpeg MP3 conversion failed")
+    return out
+
+
+def turns_from_soniox(tokens: list) -> list:
+    """Soniox tokens -> speaker turns {speaker, start, end, text} (seconds)."""
+    turns: list = []
+    for tok in tokens:
+        if tok.get("translation_status") == "translation":
+            continue
+        speaker = f"S{tok.get('speaker') or '?'}"
+        start, end = (tok.get("start_ms") or 0) / 1000, (tok.get("end_ms") or 0) / 1000
+        if not turns or turns[-1]["speaker"] != speaker:
+            turns.append({"speaker": speaker, "start": start, "end": end, "text": ""})
+        turns[-1]["text"] += tok.get("text", "")
+        turns[-1]["end"] = max(turns[-1]["end"], end)
+    for t in turns:
+        t["text"] = t["text"].strip()
+    return [t for t in turns if t["text"]]
+
+
+class SonioxTranscriber(Transcriber):
+    """Soniox async API: the whole recording in one job, speakers included. Upload and
+    transcription are deleted from Soniox right after the transcript is fetched."""
+
+    def __init__(self, name="soniox", base_url="https://api.soniox.com", model="stt-async-v5",
+                 language_hints=None, key_env="SONIOX_API_KEY", ffmpeg="ffmpeg", custom_vocabulary=None,
+                 poll_seconds=3.0, max_wait_seconds=3600):
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.model_label = f"soniox:{model}"
+        self.language_hints = list(language_hints or ["fi", "en"])
+        self.key_env = key_env
+        self.ffmpeg = ffmpeg
+        self.custom_vocabulary = list(custom_vocabulary or [])
+        self.poll_seconds = poll_seconds
+        self.max_wait_seconds = max_wait_seconds
+
+    def available(self) -> bool:
+        return bool(os.environ.get(self.key_env))
+
+    def transcribe_file(self, audio: Path) -> dict:
+        key = os.environ.get(self.key_env)
+        if not key:
+            raise ProviderError(f"{self.key_env} is not set")
+        auth = {"Authorization": f"Bearer {key}"}
+        ctype, body = multipart_body([], [("file", audio.name, audio.read_bytes(), "audio/mpeg")])
+        file_id = json.loads(api_http("POST", f"{self.base_url}/v1/files", {**auth, "Content-Type": ctype}, body))["id"]
+        tid = None
+        try:
+            req = {"model": self.model, "file_id": file_id, "language_hints": self.language_hints,
+                   "enable_speaker_diarization": True}
+            if self.custom_vocabulary:
+                req["context"] = {"terms": self.custom_vocabulary[:300]}
+            tid = json.loads(api_http("POST", f"{self.base_url}/v1/transcriptions",
+                                      {**auth, "Content-Type": "application/json"}, json.dumps(req).encode()))["id"]
+            waited = 0.0
+            while True:
+                status = json.loads(api_http("GET", f"{self.base_url}/v1/transcriptions/{tid}", auth))
+                if status.get("status") == "completed":
+                    break
+                if status.get("status") == "error":
+                    raise ProviderError(f"Soniox: {status.get('error_message') or 'transcription failed'}")
+                if waited > self.max_wait_seconds:
+                    raise ProviderError("Soniox: timed out waiting for the transcription")
+                time.sleep(self.poll_seconds)
+                waited += self.poll_seconds
+            tokens = json.loads(api_http("GET", f"{self.base_url}/v1/transcriptions/{tid}/transcript", auth))["tokens"]
+        finally:
+            for url in ([f"{self.base_url}/v1/transcriptions/{tid}"] if tid else []) + [f"{self.base_url}/v1/files/{file_id}"]:
+                try:
+                    api_http("DELETE", url, auth, attempts=2)
+                except ProviderError:
+                    pass
+        turns = turns_from_soniox(tokens)
+        return {"engine": "soniox", "model": self.model, "text": "\n".join(t["text"] for t in turns),
+                "turns": turns, "base_url": self.base_url}
+
+    def transcribe(self, snippet: Path) -> tuple[str, Any]:
+        data = self.transcribe_file(to_mp3(self.ffmpeg, snippet))
+        return data["text"], data
+
+
+class AzureMaiTranscriber(Transcriber):
+    """Microsoft MAI-Transcribe-2 through Azure Speech fast transcription (whole recording, one call).
+
+    endpoints: [{"name", "url", "key_env", "paid"}], tried in order. A free (F0) resource that has
+    used its monthly hours is skipped until the next month; paid use stops at paid_hours_per_month."""
+
+    QUOTA_HINTS = ("quota", "exceeded", "out of call volume", "limit")
+
+    def __init__(self, name="mai", endpoints=None, locales=None, usage_file=None, paid_hours_per_month=50.0,
+                 custom_vocabulary=None, api_version="2025-10-15"):
+        self.name = name
+        self.model_label = "azure:MAI-Transcribe-2"
+        self.endpoints = [e for e in (endpoints or []) if e.get("url") and e.get("key_env")]
+        self.locales = list(locales or [])
+        self.usage_file = Path(usage_file).expanduser() if usage_file else None
+        self.paid_hours_per_month = float(paid_hours_per_month)
+        self.custom_vocabulary = list(custom_vocabulary or [])
+        self.api_version = api_version
+
+    def available(self) -> bool:
+        return any(os.environ.get(e["key_env"]) for e in self.endpoints)
+
+    def _usage(self) -> dict:
+        try:
+            return json.loads(self.usage_file.read_text(encoding="utf-8")) if self.usage_file and self.usage_file.exists() else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_usage(self, usage: dict) -> None:
+        if self.usage_file:
+            self.usage_file.parent.mkdir(parents=True, exist_ok=True)
+            self.usage_file.write_text(json.dumps(usage, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def _month() -> str:
+        return time.strftime("%Y-%m")
+
+    def usable(self, endpoint: dict, seconds: float) -> bool:
+        month = self._usage().get(self._month(), {})
+        if month.get(f"{endpoint['name']}_loppu"):
+            return False
+        if endpoint.get("paid"):
+            used = float(month.get(f"{endpoint['name']}_s", 0))
+            return (used + seconds) / 3600 <= self.paid_hours_per_month
+        return True
+
+    def _record(self, endpoint: dict, seconds: float = 0.0, exhausted: bool = False) -> None:
+        usage = self._usage()
+        month = usage.setdefault(self._month(), {})
+        if seconds:
+            month[f"{endpoint['name']}_s"] = round(float(month.get(f"{endpoint['name']}_s", 0)) + seconds, 1)
+        if exhausted:
+            month[f"{endpoint['name']}_loppu"] = True
+        self._save_usage(usage)
+
+    def transcribe_file(self, audio: Path, duration_seconds: float = 0.0) -> dict:
+        definition: dict[str, Any] = {"enhancedMode": {"enabled": True, "model": "MAI-Transcribe-2"},
+                                      "diarization": {"enabled": True}}
+        if self.locales:
+            definition["locales"] = self.locales[:1]
+        if self.custom_vocabulary:
+            definition["phraseList"] = {"phrases": self.custom_vocabulary[:200]}
+        errors = []
+        for ep in self.endpoints:
+            key = os.environ.get(ep["key_env"])
+            if not key:
+                continue
+            if not self.usable(ep, duration_seconds):
+                errors.append(f"{ep['name']}: kuukauden raja käytetty")
+                continue
+            ctype, body = multipart_body([("definition", json.dumps(definition, ensure_ascii=False))],
+                                         [("audio", audio.name, audio.read_bytes(), "audio/mpeg")])
+            url = f"{ep['url'].rstrip('/')}/speechtotext/transcriptions:transcribe?api-version={self.api_version}"
+            try:
+                data = json.loads(api_http("POST", url, {"Ocp-Apim-Subscription-Key": key, "Content-Type": ctype},
+                                           body, timeout=1800, attempts=2))
+            except ProviderError as exc:
+                text = str(exc).lower()
+                if not ep.get("paid") and any(h in text for h in self.QUOTA_HINTS) and ("403" in text or "429" in text):
+                    self._record(ep, exhausted=True)
+                errors.append(f"{ep['name']}: {str(exc)[:160]}")
+                continue
+            seconds = (data.get("durationMilliseconds") or duration_seconds * 1000) / 1000
+            self._record(ep, seconds=seconds)
+            turns = [{"speaker": f"S{p.get('speaker', '?')}",
+                      "start": (p.get("offsetMilliseconds") or 0) / 1000,
+                      "end": ((p.get("offsetMilliseconds") or 0) + (p.get("durationMilliseconds") or 0)) / 1000,
+                      "text": str(p.get("text", "")).strip()} for p in data.get("phrases", [])]
+            turns = [t for t in turns if t["text"]]
+            return {"engine": "mai", "endpoint": ep["name"], "paid": bool(ep.get("paid")),
+                    "text": "\n".join(t["text"] for t in turns), "turns": turns}
+        raise ProviderError("MAI ei käytettävissä: " + ("; ".join(errors) or "ei avaimia"))
+
+    def transcribe(self, snippet: Path) -> tuple[str, Any]:
+        data = self.transcribe_file(snippet)
+        return data["text"], data
+
 
 class Summarizer:
     name = "base"
