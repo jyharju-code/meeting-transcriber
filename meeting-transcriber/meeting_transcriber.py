@@ -160,18 +160,39 @@ def log(config: dict[str, Any], message: str) -> None:
         f.write(line + "\n")
 
 
-def run_osascript(script: str) -> str:
+OSASCRIPT_ERRORS: dict[str, float] = {}  # error -> last time logged (rate limit)
+OSASCRIPT_LOG: dict[str, Any] = {"config": None}
+
+
+def note_osascript_error(label: str, detail: str) -> None:
+    """Log a failed AppleScript call at most once an hour per error, so a silent detection gap
+    (missing Automation permission, a hung browser) shows up in the log."""
+    key = f"{label}: {detail[:160]}"
+    now = time.time()
+    if now - OSASCRIPT_ERRORS.get(key, 0) < 3600:
+        return
+    OSASCRIPT_ERRORS[key] = now
+    if OSASCRIPT_LOG["config"] is not None:
+        log(OSASCRIPT_LOG["config"], f"Detection cannot read {key}")
+
+
+def run_osascript(script: str, label: str = "osascript") -> str:
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
             check=False,
             capture_output=True,
             text=True,
-            timeout=8,
+            timeout=20,
         )
-    except Exception:
+    except subprocess.TimeoutExpired:
+        note_osascript_error(label, "timed out after 20 s")
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        note_osascript_error(label, type(exc).__name__)
         return ""
     if result.returncode != 0:
+        note_osascript_error(label, (result.stderr or f"exit {result.returncode}").strip())
         return ""
     return result.stdout.strip()
 
@@ -185,37 +206,29 @@ def browser_tabs(app_name: str) -> list[tuple[str, str]]:
     if not app_is_running(app_name):
         return []
 
-    if app_name == "Safari":
-        script = f"""
-set output to ""
-tell application "Safari"
-  repeat with w in windows
-    repeat with t in tabs of w
-      try
-        set output to output & (URL of t) & "{TAB_DELIMITER}" & (name of t) & linefeed
-      end try
-    end repeat
-  end repeat
-end tell
-return output
-"""
-    else:
-        script = f"""
+    # Two bulk Apple events instead of two per tab: a busy browser (a Meet call running) answers
+    # the per-tab loop too slowly, the query timed out and the meeting was not detected.
+    name_property = "name" if app_name == "Safari" else "title"
+    script = f"""
 set output to ""
 tell application "{app_name}"
-  repeat with w in windows
-    repeat with t in tabs of w
-      try
-        set output to output & (URL of t) & "{TAB_DELIMITER}" & (title of t) & linefeed
-      end try
-    end repeat
-  end repeat
+  set allUrls to URL of every tab of every window
+  set allTitles to {name_property} of every tab of every window
 end tell
+repeat with i from 1 to count of allUrls
+  set windowUrls to item i of allUrls
+  set windowTitles to item i of allTitles
+  repeat with j from 1 to count of windowUrls
+    try
+      set output to output & (item j of windowUrls) & "{TAB_DELIMITER}" & (item j of windowTitles) & linefeed
+    end try
+  end repeat
+end repeat
 return output
 """
 
     rows: list[tuple[str, str]] = []
-    for line in run_osascript(script).splitlines():
+    for line in run_osascript(script, app_name).splitlines():
         if TAB_DELIMITER in line:
             url, title = line.split(TAB_DELIMITER, 1)
             rows.append((url.strip(), title.strip()))
@@ -842,6 +855,7 @@ def watch(config_path: Path, once: bool = False) -> int:
     last_login_check = 0.0
 
     log(config, "Meeting transcriber watcher started")
+    OSASCRIPT_LOG["config"] = config
     sweep_orphan_job_folders(config)
     while True:
         updated_config = load_config(config_path)

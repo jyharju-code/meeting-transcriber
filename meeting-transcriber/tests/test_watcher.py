@@ -362,5 +362,30 @@ class CatchupTests(unittest.TestCase):
             self.assertFalse(mt.dashboard_is_recording(config, now + 3600))  # crashed app left it true
 
 
+class BrowserScanTests(unittest.TestCase):
+    def test_bulk_scan_parses_tabs_and_finds_meet(self):
+        out = ("https://meet.google.com/abc-defg-hij" + mt.TAB_DELIMITER + "Meet – Palaveri\n"
+               "https://example.com" + mt.TAB_DELIMITER + "Esimerkki\n")
+        with mock.patch.object(mt, "app_is_running", return_value=True), \
+                mock.patch.object(mt, "run_osascript", return_value=out) as osa:
+            rows = mt.browser_tabs("Google Chrome")
+        self.assertEqual(rows[0], ("https://meet.google.com/abc-defg-hij", "Meet – Palaveri"))
+        script = osa.call_args.args[0]
+        self.assertIn("URL of every tab of every window", script)  # one bulk query, not one per tab
+
+    def test_failed_query_is_logged_once(self):
+        logged = []
+        mt.OSASCRIPT_ERRORS.clear()
+        mt.OSASCRIPT_LOG["config"] = {}
+        failed = mock.Mock(returncode=1, stderr="Not authorized to send Apple events to Safari. (-1743)", stdout="")
+        with mock.patch.object(mt.subprocess, "run", return_value=failed), \
+                mock.patch.object(mt, "log", side_effect=lambda c, m: logged.append(m)):
+            mt.run_osascript("x", "Safari")
+            mt.run_osascript("x", "Safari")
+        mt.OSASCRIPT_LOG["config"] = None
+        self.assertEqual(len(logged), 1)
+        self.assertIn("-1743", logged[0])
+
+
 if __name__ == "__main__":
     unittest.main()
