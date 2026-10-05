@@ -175,9 +175,11 @@ def run(config: dict, recording: Path, job_dir: Path, progress) -> str:
         segments.append({"lines": lines, "method": j["method"]})
 
     TR.write_progress(progress, stage="transcribing", progress=0.7, message="Huipputaso: puhujat")
-    mapping = MM.unify_speakers(gen, segments, str(config.get("meeting_owner", "") or ""))
-    for i, seg in enumerate(segments, start=1):
-        seg["lines"] = [dict(l, speaker=mapping.get(f"{i}:{l['speaker']}", f"Puhuja {l['speaker'].lstrip('S')}"))
+    # Soniox speaker labels hold for the whole recording, so name them once for the whole meeting.
+    whole = [{"lines": [l for s in segments for l in s["lines"]]}]
+    mapping = MM.unify_speakers(gen, whole, str(config.get("meeting_owner", "") or ""))
+    for seg in segments:
+        seg["lines"] = [dict(l, speaker=mapping.get(f"1:{l['speaker']}", f"Puhuja {l['speaker'].lstrip('S')}"))
                         for l in seg["lines"]]
 
     TR.write_progress(progress, stage="transcribing", progress=0.78, message="Huipputaso: luettava versio")
