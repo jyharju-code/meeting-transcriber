@@ -86,3 +86,29 @@ Käyttäjä vaihtaa kytkimen itse. Kytkimen asento näytetään selkeästi (Dash
 ## D7 · Vanhojen palaverien käsittelysijainnit (3.10.2026)
 
 **Päätös:** listaa ei koota.
+
+## D8 · Maailmanlaajuinen perustaso: Soniox (5.10.2026)
+
+**Päätös:** Maailmanlaajuisen asennon perustason tekee Soniox (stt-async-v5), koko tallenne yhdellä kutsulla, puhujat mukana. Jos Soniox ei vastaa, perustaso tehdään Gemini 3.5 Transcribella kuten ennen.
+
+**Peruste:** viiden palaverin vertailussa (yksi kuunneltu vastauslista ja neljä sokkona tuomaroitua palaveria, 45 kiistakohtaa kustakin) Soniox teki 38 merkitysvirhettä, Gemini 3.5 Transcribe smart 94.
+
+## D9 · Maailmanlaajuinen Huipputaso: Soniox + MAI, Gemini valitsee (5.10.2026)
+
+**Päätös:** Huipputaso = Soniox ja Microsoft MAI-Transcribe-2 rinnakkain, ja Gemini 3.8 Flash (EU) kuuntelee äänen ja valitsee kiistakohdissa. MAI ajetaan Azure Speechin kautta Ruotsin alueella (ensin ilmainen F0, sitten maksullinen S0, kuukausikatto). Vercel jää pois.
+
+**Varaketju:** Soniox + MAI → Soniox + Gemini 3.5 Transcribe → MAI + Gemini 3.5 Transcribe → vanha Gemini-Huipputaso. Jokainen heikennys merkitään litteraattiin, ja siitä tulee ilmoitus.
+
+**Peruste:** sama vertailu: Soniox + MAI 13 merkitysvirhettä / 180 kiistakohtaa, Soniox yksin 38, MAI yksin 46, Gemini perustaso 94. Geminin lisääminen kolmanneksi ei parantanut tulosta.
+
+## D10 · Huipputaso päällä oletuksena (5.10.2026)
+
+**Päätös:** Laatukytkin on oletuksena HUIPPUTASO. Perustaso tulee heti, Huipputaso korvaa sen muutaman minuutin päästä.
+
+## D11 · Maailmanlaajuinen asento saa käyttää muitakin kuin Googlea (5.10.2026)
+
+**Päätös:** Maailmanlaajuisessa asennossa Soniox ja Microsoft Azure (MAI) ovat sallittuja Googlen lisäksi. D3:n "vain Google" koskee jatkossa vain EU-asentoa, kunnes D12 ratkeaa. D4 (lamppu, EU-asennossa saa vaihtaa ulos kun lamppu palaa) pysyy ennallaan.
+
+## D12 · EU-asennon Huipputaso Soniox EU + MAI Ruotsi (avoin)
+
+**Tila:** odottaa Sonioxin EU-projektia (pyyntö lähetetty 5.10.). Kun se on auki, EU-asento voi käyttää samaa reittiä: Soniox EU (Frankfurt), MAI (Azure Sweden Central) ja Gemini EU.
