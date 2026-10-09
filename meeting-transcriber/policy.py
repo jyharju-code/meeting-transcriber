@@ -189,17 +189,16 @@ def outside_eu(job_dir: Path) -> list[str]:
 
 
 def status_line(job_dir: Path) -> str:
+    """Processing-location line for the outputs. Routine routes are not written into transcripts
+    (D13: they live in manifest.json, kutsut.jsonl and huipputaso.json); only the D4 exception is:
+    an EU meeting that was processed partly outside the EU."""
     s = job_settings(job_dir)
-    laatu = "Huipputaso" if s["laatu"] == HUIPPU else "Perustaso"
     if s["sijainti"] == EU:
         hosts = outside_eu(job_dir)
         if hosts:
             return (f"> 🔴 **Käsitelty: EU-asento, mutta osa käsittelystä tehtiin EU:n ulkopuolella** "
-                    f"({', '.join(hosts)}), koska EU-palvelu ei vastannut. {laatu}.")
-        return f"> 🇪🇺 **Käsitelty: EU** (vain EU-palvelu). {laatu}."
-    used = service_names(job_dir)
-    return f"> 🌍 **Käsitelty: maailmanlaajuinen** ({', '.join(used) if used else 'Google'}). {laatu}."
-
+                    f"({', '.join(hosts)}), koska EU-palvelu ei vastannut.")
+    return ""
 
 SERVICES = (("soniox.com", "Soniox"), ("cognitiveservices.azure.com", "Microsoft Azure (MAI)"),
             ("aiplatform.eu.rep.googleapis.com", "Google EU"), ("googleapis.com", "Google AI Studio"))
@@ -226,7 +225,9 @@ def stamp_outputs(job_dir: Path, names: tuple[str, ...] = ("transcript.md", "tra
         text = path.read_text(encoding="utf-8")
         lines = [l for l in text.splitlines() if not l.startswith("> 🔴 **Käsitelty")
                  and not l.startswith("> 🇪🇺 **Käsitelty") and not l.startswith("> 🌍 **Käsitelty")]
-        if lines and lines[0].startswith("#"):
+        if not line:
+            new = lines
+        elif lines and lines[0].startswith("#"):
             new = [lines[0], "", line] + lines[1:]
         else:
             new = [line, ""] + lines

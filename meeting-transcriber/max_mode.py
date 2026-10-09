@@ -302,7 +302,6 @@ def run(config: dict, recording: Path, job_dir: Path, progress, use_transcribe: 
     sources = ("neljä litterointia (Gemini 3.5 Transcribe ×2, Gemini Flash EU ×2)" if use_transcribe
                else "kaksi litterointia (Gemini Flash EU ×2)")
     header = [
-        f"Huipputaso: {sources}; tuomarimalli {ap_judge[2]} (EU) kuunteli äänen ja ratkaisi erot.",
         "Puhujat yhdistetty ja nimetty tekstin perusteella, tarkista: " + (", ".join(names) or "ei varmoja nimiä") + ".",
         f"[?] = epävarma kohta, tarkista kuuntelemalla ({uncertain} kpl).",
     ]

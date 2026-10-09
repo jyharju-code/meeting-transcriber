@@ -112,3 +112,7 @@ Käyttäjä vaihtaa kytkimen itse. Kytkimen asento näytetään selkeästi (Dash
 ## D12 · EU-asennon Huipputaso Soniox EU + MAI Ruotsi (avoin)
 
 **Tila:** odottaa Sonioxin EU-projektia (pyyntö lähetetty 5.10.). Kun se on auki, EU-asento voi käyttää samaa reittiä: Soniox EU (Frankfurt), MAI (Azure Sweden Central) ja Gemini EU.
+
+## D13 · Käsittelyreittiä ei merkitä litteraatteihin (9.10.2026)
+
+**Päätös:** Litteraatteihin ja yhteenvetoihin ei kirjoiteta rutiininomaisesti käsittelypaikkaa eikä Huipputason reittiä. Tieto on palaverin kansiossa: `manifest.json`, `kutsut.jsonl` ja `huipputaso.json`. Poikkeukset merkitään edelleen: 🔴 kun EU-asennon palaveri käsiteltiin osin EU:n ulkopuolella (D4) ja ⚠️ kun Huipputaso heikkeni.

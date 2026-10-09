@@ -194,12 +194,11 @@ def run(config: dict, recording: Path, job_dir: Path, progress) -> str:
     readable = [l for c in cleaned for l in c["lines"]]
     names = sorted({v for v in mapping.values() if not v.startswith("Puhuja")})
     uncertain = sum(l["text"].count("[?]") for l in verbatim)
-    header = [f"Huipputaso: {route}; tuomarimalli {judge[2]} kuunteli äänen ja ratkaisi erot.",
-              "Puhujat nimetty tekstin perusteella, tarkista: " + (", ".join(names) or "ei varmoja nimiä") + ".",
+    header = ["Puhujat nimetty tekstin perusteella, tarkista: " + (", ".join(names) or "ei varmoja nimiä") + ".",
               f"[?] = epävarma kohta, tarkista kuuntelemalla ({uncertain} kpl)."]
     failed = [f"jakso {i + 1}" for i, s in enumerate(segments) if s["method"].startswith("backbone only")]
     if degraded:
-        header.insert(0, f"⚠️ Heikennetty Huipputaso: {'MAI' if son else 'Soniox'} ei vastannut, käytettiin {route}.")
+        header.insert(0, f"⚠️ Heikennetty Huipputaso: {'MAI' if son else 'Soniox'} ei vastannut.")
     if failed:
         header.append("Huom: tuomari ei saanut ratkaistua, runko sellaisenaan: " + ", ".join(failed) + ".")
     head = "\n".join(f"> {h}" for h in header)

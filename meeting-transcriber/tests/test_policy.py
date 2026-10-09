@@ -121,7 +121,7 @@ class LampTests(unittest.TestCase):
             with mock.patch.object(policy, "notify") as notify:
                 self.assertFalse(policy.report_violation(job, cfg))
             notify.assert_not_called()
-            self.assertIn("Käsitelty: EU", policy.status_line(job))
+            self.assertEqual(policy.status_line(job), "")  # D13: no routine route in the outputs
 
     def test_eu_job_that_went_outside_lights_the_lamp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,18 +141,22 @@ class LampTests(unittest.TestCase):
             cfg = {"lamp_file": str(Path(tmp) / "lamppu.json")}
             job = self.make_job(Path(tmp), "maailmanlaajuinen", ["generativelanguage.googleapis.com"])
             self.assertFalse(policy.report_violation(job, cfg))
-            self.assertIn("maailmanlaajuinen", policy.status_line(job))
+            self.assertEqual(policy.status_line(job), "")
 
-    def test_stamp_is_idempotent(self):
+    def test_stamp_only_marks_the_exception_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            job = self.make_job(Path(tmp), "eu", [])
-            (job / "summary.md").write_text("# Kokousmuistiinpano\n\nTeksti.\n", encoding="utf-8")
+            job = self.make_job(Path(tmp), "eu", ["aiplatform.eu.rep.googleapis.com"])
+            old = "# Kokousmuistiinpano\n\n> 🇪🇺 **Käsitelty: EU** (vain EU-palvelu). Huipputaso.\n\nTeksti.\n"
+            (job / "summary.md").write_text(old, encoding="utf-8")
+            policy.stamp_outputs(job)  # an old routine stamp is removed
+            self.assertNotIn("Käsitelty", (job / "summary.md").read_text(encoding="utf-8"))
+            with (job / policy.CALL_LOG).open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"host": "generativelanguage.googleapis.com", "tulos": "ok"}) + "\n")
             policy.stamp_outputs(job)
             policy.stamp_outputs(job)
             text = (job / "summary.md").read_text(encoding="utf-8")
-            self.assertEqual(text.count("Käsitelty"), 1)
-            self.assertTrue(text.startswith("# Kokousmuistiinpano\n\n> 🇪🇺"))
-
+            self.assertEqual(text.count("🔴"), 1)
+            self.assertTrue(text.startswith("# Kokousmuistiinpano\n\n> 🔴"))
 
 class RoutingTests(unittest.TestCase):
     base = {"agent_platform_project": "p", "agent_platform_location": "eu"}
